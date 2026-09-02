@@ -242,13 +242,24 @@ curl -s http://<endpoint>/v1/chat/completions \
 
 ### 6b. Open the n8n UI
 
-n8n is loopback-only. From your workstation:
+n8n is pinned to `127.0.0.1:5678` and never exposed on the network (it runs
+arbitrary code). How you reach the UI depends on where you are:
 
-```sh
-ssh -L 5678:127.0.0.1:5678 <user>@<this-host>
-```
+- **At the machine itself** (it has a desktop): just open
+  <http://localhost:5678> in a local browser.
+- **Headless box, administering from your laptop**: forward the port, then use
+  your laptop browser:
+  ```sh
+  ssh -L 5678:127.0.0.1:5678 <user>@<this-host>
+  # then open http://localhost:5678 on your laptop
+  ```
 
-Open <http://localhost:5678>, create the owner account (local, stays on the box).
+Either way the address must be exactly `http://localhost:5678` — Microsoft Entra
+only accepts `http://localhost` as a plain-HTTP OAuth redirect (§6c), not an IP
+or hostname. Create the owner account when prompted (local, stays on the box).
+
+This is only for setup and later maintenance. Once the workflow is Active the
+pipeline runs headless — no tunnel, no browser.
 
 ### 6c. Add credentials
 
