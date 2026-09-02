@@ -1,0 +1,515 @@
+{
+  "name": "Academy Agent (Outlook)",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "output": "fields",
+        "fields": [
+          "id",
+          "conversationId",
+          "subject",
+          "bodyPreview",
+          "body",
+          "internetMessageId",
+          "from",
+          "receivedDateTime"
+        ],
+        "filters": {
+          "foldersToInclude": [
+            "inbox"
+          ]
+        },
+        "options": {}
+      },
+      "id": "trigger-outlook",
+      "name": "New Outlook email",
+      "type": "n8n-nodes-base.microsoftOutlookTrigger",
+      "typeVersion": 1,
+      "position": [
+        -288,
+        304
+      ],
+      "notes": "Needs a Microsoft Outlook OAuth2 credential (Mail.ReadWrite). Poll, not webhook: a Graph subscription needs a publicly reachable URL and this n8n is bound to loopback."
+    },
+    {
+      "parameters": {},
+      "id": "test-trigger",
+      "name": "Test: run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -496,
+        64
+      ],
+      "notes": "A second entry point into the same path, so the agent can be developed and tested without a mailbox. Everything downstream of here is the production path -- only the trigger differs. Delete this node and the one beside it once Outlook is polling."
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"id\": \"TEST-MESSAGE-ID-31\",\n  \"conversationId\": \"TEST-CONVERSATION-31\",\n  \"internetMessageId\": \"<test-{{ $now.toMillis() }}@example.com>\",\n  \"subject\": \"Re: TÜV Certification – Examination Format and Handout Policy\",\n  \"bodyPreview\": \"Good evening, I do have some questions regarding the TÜV certification: 1. How does the examination look like? Are there multiple choice questions as in the video training or other kinds of questions, too?\",\n  \"body\": {\n    \"contentType\": \"html\",\n    \"content\": \"<html><body><p>Good evening,</p><p>I do have some questions regarding the T&uuml;V certification:</p><ol><li>How does the examination look like? Are there multiple choice questions as in the video training or other kinds of questions, too?</li><li>As a participant of the video training: is there the possibility to have a kind of handouts available in the examination? Some slides to look up information from the course?</li></ol><p>Many thanks in advance</p></body></html>\"\n  },\n  \"from\": {\n    \"emailAddress\": {\n      \"address\": \"client31@example.com\",\n      \"name\": \"Test User\"\n    }\n  },\n  \"receivedDateTime\": \"2026-08-31T18:00:00Z\"\n}",
+        "options": {}
+      },
+      "id": "test-email",
+      "name": "Test: sample email",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -288,
+        64
+      ],
+      "notes": "Shaped exactly like the Outlook trigger's output, HTML body and all, so the Code node below is exercised the same way it will be in production. Edit the body to try a different email.\n\ninternetMessageId is generated per run, and has to be. Dedupe is on that id, not on the body: with it hardcoded, the first run records the id and EVERY later run -- however you rewrite the email -- comes back duplicate=true and stops at 'Do nothing', with a perfectly healthy academic classification sitting right above it. conversationId is deliberately NOT generated, so repeated runs accumulate into one thread and follow-ups can be tested. Reset that thread with:\n  DELETE FROM messages WHERE conversation_id = 'TEST-CONVERSATION-1';"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "proceed",
+              "leftValue": "={{ $json.proceed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "is-academy",
+      "name": "Is label \"Academy\"?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        128,
+        304
+      ],
+      "notes": "`proceed` is true only when the email classified as academic above the confidence threshold, with administrative and spam both clear, AND it has not already been handled. Anything else -- including a dead API, whose error shape has no `proceed` -- goes false.\n\nWhen this sends mail to 'Do nothing', open Prepare's output and read `reason`. It says which condition failed, in words."
+    },
+    {
+      "parameters": {},
+      "id": "do-nothing",
+      "name": "Do nothing",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        432,
+        832
+      ],
+      "notes": "Administrative, spam, unclassifiable and already-handled mail. No draft and no auto-reply: it sits in the inbox for a human.\n\nThis node's INPUT carries `reason` from Prepare, naming which check refused the email. Open it before assuming anything is broken."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('Prepare').item.json.history ? 'Conversation so far (for context and phrasing only -- it is not a source of facts):\\n\\n' + $('Prepare').item.json.history + '\\n\\n---\\n\\n' : '' }}Latest email\\nSubject: {{ $('Prepare').item.json.subject }}\\n\\n{{ $('Prepare').item.json.email_text }}{{ $('Prepare').item.json.query && $('Prepare').item.json.query !== $('Prepare').item.json.email_text ? '\\n\\n(Read as a standalone question, the latest email asks: ' + $('Prepare').item.json.query + ')' : '' }}{{ $('Prepare').item.json.format === 'list' ? '\\n\\nFormat: reply as a bulleted list -- one \"- \" item per point, at most six points, no heading or preamble before the first item.' : '\\n\\nFormat: reply in plain prose, at most four sentences, with no list.' }}",
+        "options": {
+          "systemMessage": "You draft replies to enquiries about the training programmes described in the Academy documentation.\n\nBefore you answer you MUST search academy_docs. If the first search comes back thin, search again with the enquirer's own wording, and again with the level or module name if they named one.\n\nRules:\n- Use only what academy_docs returns. Never use outside knowledge, and never guess a date, a price, a duration or a prerequisite that is not written there. This applies especially to subjects you know about independently -- answering an automotive security question from your own knowledge rather than from the retrieved documentation is the failure this system exists to prevent.\n- If the documentation does not contain the answer, reply with exactly NOT_IN_DOCUMENTS and nothing else. Do not explain, do not apologise, and do not write a sentence saying the documentation does not specify it -- that sentence is a refusal wearing an answer's clothes, and it defeats the check downstream. The bare token.\n- Quote the specific level and module names from the documentation rather than paraphrasing them vaguely.\n- Match the shape of your answer to the request. When the enquirer wrote their questions as a numbered or bulleted list, asked for a list or \"in points\", or asked several separate things, reply as a bulleted list -- one \"- \" item per point, at most six points, no heading or preamble before the first item. Otherwise answer in plain prose, at most four sentences. The \"Format:\" line at the end of the message says which the latest email calls for -- follow it.\n- Address the enquirer directly.\n- Do not mention documents, extracts, context, or the search tool in your answer.\n- Write the body only. No greeting and no sign-off -- those are added after you.\n\nYou are shown the earlier messages of this conversation. They tell you what was asked and how it was phrased. They are NOT a source of facts: every factual claim must come from academy_docs, even if an earlier reply in this conversation stated it. If the documentation does not answer the latest question, reply with exactly NOT_IN_DOCUMENTS even when the conversation appears to contain the answer.",
+          "maxIterations": 6,
+          "returnIntermediateSteps": true
+        }
+      },
+      "id": "ai-agent",
+      "name": "AI Agent — generate reply",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        416,
+        48
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "returnIntermediateSteps is on so `intermediateSteps` shows which searches ran and what came back -- without it a wrong answer gives you nothing to look at.\n\nThe thread arrives in the prompt rather than through a memory node, from data/threads.db via 'Thread context'. The system message below is what keeps it context and not evidence: a model shown a previous reply will otherwise treat it as a source and restate it as fact, which launders anything that slipped through earlier into permanent thread truth.\n\nThe standalone rewrite is appended because embeddings have no memory: \"and the second one?\" is clear to a reader and a bag of stopwords to bge-m3. It is offered to the agent rather than substituted for the email, because the agent chooses its own search terms and the enquirer's own words are still what it is answering."
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "qwen3.5-9b",
+          "cachedResultName": "qwen3.5-9b"
+        },
+        "responsesApiEnabled": false,
+        "options": {
+          "maxTokens": 700,
+          "temperature": 0,
+          "timeout": 180000,
+          "maxRetries": 2
+        }
+      },
+      "id": "local-model",
+      "name": "Local Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        416,
+        256
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "LiteLLM (ai-network)"
+        }
+      },
+      "notes": "qwen3.5-9b behind LiteLLM, by container name -- not localhost:4001, which is the host mapping. responsesApiEnabled is off: that is OpenAI's /responses endpoint and LiteLLM serves these models on /chat/completions. LiteLLM also applies enable_thinking:false, without which the model spends its budget on reasoning and emits nothing."
+    },
+    {
+      "parameters": {
+        "mode": "retrieve-as-tool",
+        "toolDescription": "Search the Academy training documentation: levels, modules, curriculum, prerequisites, hardware kits, certification and assessment. Pass a natural-language question. Returns extracts from the source documents.",
+        "chromaCollection": {
+          "__rl": true,
+          "mode": "list",
+          "value": "docs",
+          "cachedResultName": "docs"
+        },
+        "options": {}
+      },
+      "id": "vdb-tool",
+      "name": "academy_docs",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreChromaDB",
+      "typeVersion": 1.3,
+      "position": [
+        480,
+        384
+      ],
+      "credentials": {
+        "chromaSelfHostedApi": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "Chroma (ai-network)"
+        }
+      },
+      "notes": "The node name IS the tool name at typeVersion 1.3 -- renaming this node renames the tool the system message tells the model to call, so rename both or neither. topK 4 is measured, not a guess: see README, \"Chunk size is a retrieval parameter\"."
+    },
+    {
+      "parameters": {
+        "model": "bge-m3",
+        "options": {
+          "batchSize": 16,
+          "stripNewLines": false
+        }
+      },
+      "id": "embeddings",
+      "name": "Embeddings bge-m3",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        480,
+        576
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "LiteLLM (ai-network)"
+        }
+      },
+      "notes": "Must stay bge-m3, the model `rag ingest` embedded the collection with. Vectors from two embedders are not comparable and the dimensions differ (1024 against OpenAI's 1536), so a mismatch fails outright rather than degrading quietly -- which is the good outcome. `dimensions` is deliberately unset: it is a text-embedding-3 feature and bge-m3 rejects it. stripNewLines off because bge-m3 takes raw text on both sides."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "grounded",
+              "leftValue": "={{ $json.grounded }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "grounded",
+      "name": "Grounded answer?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1088,
+        144
+      ],
+      "notes": "Was the answer actually grounded in retrieved documentation. The two regexes that used to sit in this condition now live in rag.core.refuses_in_prose, called by Finalize -- see that node. `reason` on the false branch says whether the documents lack the answer or the model refused to admit it."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.microsoft.com/v1.0/me/messages/{{ $('Prepare').item.json.ref }}/createReply",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "microsoftOutlookOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ comment: $json.reply }) }}",
+        "options": {}
+      },
+      "id": "outlook-draft",
+      "name": "Outlook Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1424,
+        -192
+      ],
+      "notes": "createReply, not the Outlook node's Reply operation -- Reply SENDS. This leaves a draft in the mailbox with the quoted original beneath it, threaded correctly, for a human to read and send. Nothing in this workflow ever sends mail.\n\nThe message id comes from Prepare's `ref`, which is the trigger's own id passed straight through. That is the only Outlook-specific value left downstream of the trigger."
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ JSON.stringify({ drafted: false, reason: $json.reason, subject: $('Prepare').item.json.subject, conversation_id: $('Prepare').item.json.conversation_id, agent_output: $json.agent_output }) }}",
+        "options": {}
+      },
+      "id": "human-queue",
+      "name": "Human queue",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1392,
+        240
+      ],
+      "notes": "Academic mail the documents cannot answer. No draft: an auto-reply saying nothing is worse than silence, and the email is still sitting in the inbox for a human. Point this at a notification channel when there is one."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://classifier:8100/threads/reply",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ conversation_id: $('Finalize').item.json.conversation_id, reply: $('Finalize').item.json.reply, subject: $('Finalize').item.json.subject, grounded: true }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "record-reply",
+      "name": "Record reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1728,
+        -32
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "The other half of the memory: without it the store keeps the enquirer's questions and none of the answers, and the next email is shown a conversation in which nobody replied.\n\nDeliberately AFTER 'Outlook Draft'. This records a reply as something the enquirer has seen; if the draft was never created there is nothing to have seen. onError continues -- the draft already exists by then, and failing here would not remove it."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://classifier:8100/emails/prepare",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ body: ($json.body && $json.body.content) ? $json.body.content : ($json.bodyPreview || ''), is_html: !($json.body && $json.body.contentType === 'text'), subject: $json.subject || '', conversation_id: $json.conversationId || '', message_id: $json.internetMessageId || $json.id || '', ref: $json.id || '' }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "prepare",
+      "name": "Prepare",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -64,
+        304
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Everything knowable before an answer exists, in one call: HTML stripped to prose, the quoted reply cut off, the thread loaded, this email recorded, and the classifier run against that thread.\n\nIt replaced a Code node and two HTTP nodes. The Code node's forty lines of JavaScript are now mail/text.py, which can be unit-tested and which a Gmail workflow could reuse; in a Code node they would have been copy-pasted.\n\nBRANCH ON `proceed`, READ `reason`. That pairing is the point. The old gate tested route == 'rag' AND duplicate !== true in one condition, so every refusal looked identical -- and three unrelated faults in one week (a stopped model, a hardcoded message id, pinned node data) all presented as the same silent 'Do nothing'. `reason` now names which one it is.\n\n`ref` is passed through untouched and comes back out: it is the Graph message id the draft replies to, carried across the agent without any node needing to know what it is.\n\nThe same expression reads the real trigger and the test node, because the test node is shaped exactly like Outlook's output. onError continues so a dead API routes to a human rather than failing the run -- the error shape has no `proceed`, so the IF sends it down the false branch."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://classifier:8100/emails/finalize",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ output: $json.output || '', subject: $('Prepare').item.json.subject || '', conversation_id: $('Prepare').item.json.conversation_id, format: $('Prepare').item.json.format }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "finalize",
+      "name": "Finalize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        832,
+        144
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Everything decidable once the answer exists: was it grounded, and what does the draft read like.\n\nBoth halves used to live in this canvas -- the refusal test as two regexes inside an IF condition, the greeting and sign-off as string concatenation in a Code node. Both were copies of rag.core, and a copied safety check is one that will eventually disagree with itself. They are now one implementation, covered by scripts/rag_eval.py.\n\nThe refusal test is deliberately two nets: the NOT_IN_DOCUMENTS token leaks. Measured on seven unanswerable questions the 9B emitted the token for four and answered the other three in prose -- 'the provided documentation does not specify how many days' -- a well-formed answer that says nothing. `reason` distinguishes them, so you can tell a corpus gap from a model that will not say so.\n\nThe shell is assembled here and never by the model. Retrieval grounds the factual body; letting the model write the courtesy around it reopens the gap it was stopped from filling ('we look forward to seeing you at our campus')."
+    }
+  ],
+  "connections": {
+    "Test: run manually": {
+      "main": [
+        [
+          {
+            "node": "Test: sample email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test: sample email": {
+      "main": [
+        [
+          {
+            "node": "Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Outlook email": {
+      "main": [
+        [
+          {
+            "node": "Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is label \"Academy\"?": {
+      "main": [
+        [
+          {
+            "node": "AI Agent — generate reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Local Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent — generate reply",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "academy_docs": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent — generate reply",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings bge-m3": {
+      "ai_embedding": [
+        [
+          {
+            "node": "academy_docs",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent — generate reply": {
+      "main": [
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grounded answer?": {
+      "main": [
+        [
+          {
+            "node": "Outlook Draft",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Human queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outlook Draft": {
+      "main": [
+        [
+          {
+            "node": "Record reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare": {
+      "main": [
+        [
+          {
+            "node": "Is label \"Academy\"?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize": {
+      "main": [
+        [
+          {
+            "node": "Grounded answer?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "active": false
+}

@@ -21,8 +21,10 @@
       "name": "Email form",
       "type": "n8n-nodes-base.formTrigger",
       "typeVersion": 2,
-      "position": [0, 0],
-      "webhookId": "email-classifier-form"
+      "position": [
+        0,
+        0
+      ]
     },
     {
       "parameters": {
@@ -44,7 +46,10 @@
       "name": "Classify",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [240, 0],
+      "position": [
+        240,
+        0
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -58,15 +63,34 @@
       "name": "Show result",
       "type": "n8n-nodes-base.form",
       "typeVersion": 1,
-      "position": [480, 0]
+      "position": [
+        480,
+        0
+      ]
     }
   ],
   "connections": {
     "Email form": {
-      "main": [[{ "node": "Classify", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Classify": {
-      "main": [[{ "node": "Show result", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Show result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "settings": {},

@@ -1,0 +1,12 @@
+# The image only needs the source packages + requirements.txt (see Dockerfile).
+# Keep the build context small and secrets out of it.
+.git
+.venv
+.env
+data
+n8n
+scripts
+*.md
+docker-compose*.yml
+__pycache__
+*.pyc

@@ -7,14 +7,19 @@
 #   docker compose up -d --build
 #   docker compose exec classifier python -m rag ingest --reset
 #
-# See HANDOFF.md for the full first-run checklist -- and its section 6 before
-# pointing this at an Ollama backend.
+# See README.md for the full first-run checklist -- and its "Chat model
+# requirements" section before pointing this at an Ollama backend.
+#
+# Reaching the chat model: EC_BASE_URL / LLM_URL must be an address a container
+# can dial. A model server on THIS host bound to 127.0.0.1 only is NOT reachable
+# -- bind it to 0.0.0.0 (or the docker bridge IP) and use
+# http://host.docker.internal:<port>/v1, or put the model server on a docker
+# network this stack also joins (see docker-compose.override.yml.example).
 
 services:
-  # bge-m3 embeddings, CPU-only, OpenAI-compatible at /v1/embeddings. Replaces
-  # the llama-bge-m3 server that used to live in the ai-server stack. 1024-dim,
-  # same as before, so retrieval behaviour is unchanged. First boot downloads
-  # the model (~2GB) into the embed-cache volume; subsequent boots are instant.
+  # bge-m3 embeddings, CPU-only, OpenAI-compatible at /v1/embeddings. 1024-dim.
+  # First boot downloads the model (~2GB) into the embed-cache volume; later
+  # boots are instant.
   embedder:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
     container_name: email-classifier-embedder
@@ -26,8 +31,8 @@ services:
     restart: unless-stopped
 
   # Vector store. Internal only -- the API talks to it by service name. Pin the
-  # tag to the chromadb version in requirements-rag.txt so client and server
-  # speak the same wire format.
+  # tag to the chromadb version in requirements.txt so client and server speak
+  # the same wire format.
   chromadb:
     image: chromadb/chroma:1.5.9
     container_name: email-classifier-chroma
@@ -39,8 +44,8 @@ services:
     ports:
       # Loopback only, for running `python -m rag` from the host if you want to.
       # Not needed for normal operation -- ingest runs inside the API container.
-      # 8011 rather than 8010: another Chroma (the old ai-server stack) may
-      # already hold 8010 on the dev box. The container port is still 8000.
+      # 8011 rather than 8010: another Chroma may already hold 8010 on the dev
+      # box. The container port is still 8000.
       - "127.0.0.1:8011:8000"
     networks:
       - emailflow
@@ -62,15 +67,15 @@ services:
       # bigger one worth using for `--large` evals.
       - EC_LARGE_MODEL=${CHAT_MODEL_LARGE:-${CHAT_MODEL}}
       - EC_THRESHOLD=${EC_THRESHOLD:-0.9}
-      # Ollama backends: see HANDOFF.md section 6. Both are no-ops when unset.
+      # Ollama backends: see README.md "Chat model requirements". No-ops unset.
       - EC_ALLOW_UNCALIBRATED=${EC_ALLOW_UNCALIBRATED:-}
       - EC_NUM_CTX=${EC_NUM_CTX:-}
+      # Reply-shell wording. Override in .env; defaults match rag/core.py. A
+      # literal \n in the value becomes a line break.
+      - RAG_EMAIL_GREETING=${RAG_EMAIL_GREETING:-Hello,}
+      - RAG_EMAIL_SIGNOFF=${RAG_EMAIL_SIGNOFF:-Best regards,\nThe Training Team}
       # --- everything below is in-compose wiring, do not touch ------------
-      # The container name, not the service alias "chromadb": this service is
-      # also attached to the external chatmodel network (for LiteLLM), and that
-      # network has its own container aliased "chromadb" -- the bare name
-      # resolves to the wrong one. The container_name is unambiguous.
-      - RAG_CHROMA_HOST=email-classifier-chroma
+      - RAG_CHROMA_HOST=chromadb
       - RAG_CHROMA_PORT=8000
       - RAG_COLLECTION=docs
       - RAG_MAX_DISTANCE=1.0
@@ -87,10 +92,10 @@ services:
       - ./data:/app/data
     ports:
       - "127.0.0.1:8100:8100"
-    # Kept for the documented "LiteLLM on the docker host itself" setup, but the
-    # local stack reaches LiteLLM by service name over the chatmodel network
-    # instead (see below) -- a host-published 127.0.0.1:PORT mapping is not
-    # reachable through host-gateway, only a 0.0.0.0 / bridge-IP one is.
+    # Lets EC_BASE_URL use http://host.docker.internal:<port>/v1 to reach a
+    # model server on the docker host itself -- provided that server is bound to
+    # 0.0.0.0 / the bridge IP, not 127.0.0.1 only. Harmless if you point
+    # EC_BASE_URL at a LAN/tailnet address or a shared docker network instead.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -102,10 +107,6 @@ services:
       start_period: 20s
     networks:
       - emailflow
-      # LiteLLM (the chat model) lives in the ai-server compose and publishes
-      # only 127.0.0.1:4001, so it is not reachable via host-gateway. Join its
-      # network and address it as http://litellm:4000/v1 (set in .env).
-      - chatmodel
     restart: unless-stopped
 
   n8n:
@@ -134,10 +135,6 @@ services:
       - n8n_data:/home/node/.n8n
     networks:
       - emailflow
-      # The AI Agent node's chat model and vector store (LiteLLM, and the
-      # llama-bge-m3 / shared services) live on the ai-server network. n8n makes
-      # only outbound calls to them; its own 5678 stays loopback-published.
-      - chatmodel
     restart: unless-stopped
 
 volumes:
@@ -148,9 +145,3 @@ volumes:
 networks:
   emailflow:
     driver: bridge
-  # The ai-server stack's network, where LiteLLM (and the shared Chroma, and the
-  # llama.cpp runners) live. External: this compose does not create or own it.
-  # `docker network ls | grep ai-network` if the name has drifted.
-  chatmodel:
-    external: true
-    name: ai-server_ai-network

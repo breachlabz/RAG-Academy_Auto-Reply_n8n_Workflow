@@ -1,1 +1,24 @@
+# One dependency set for the whole project: the API, the classifier/RAG/threads
+# libraries, and the `python -m rag` ingest CLI. Installed in the image and into
+# a local .venv for running the CLI and scripts on the host.
+
+# --- HTTP client + API surface --------------------------------------------
 requests>=2.31
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.0
+
+# --- vector store --------------------------------------------------------
+# Full chromadb, not chromadb-client: the client-only package ships without
+# onnxruntime. Keep this pinned in step with the chromadb/chroma image tag in
+# docker-compose.yml so client and server speak the same wire format.
+chromadb>=1.0
+
+# --- document ingest ----------------------------------------------------
+# Used only by `python -m rag ingest`. Each is imported inside its loader
+# function, so importing the API package does not require them at runtime.
+python-docx>=1.1      # .docx -> markdown
+pypdf>=4.0            # .pdf  -> markdown (text layer only; scans yield nothing)
+beautifulsoup4>=4.12  # .html -> markdown
+lxml>=5.0             # bs4's parser
+openpyxl>=3.1         # the Excel document manifest (scripts/, `rag manifest`)

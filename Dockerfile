@@ -2,13 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements-api.txt requirements-rag.txt ./
-RUN pip install --no-cache-dir -r requirements-api.txt -r requirements-rag.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# No embedder is baked in. Embedding is bge-m3 over HTTP through LiteLLM, and
-# rag.core builds every collection with embedding_function=None, so Chroma
-# never reconstructs its default MiniLM and never downloads the 80MB ONNX blob
-# this image used to carry.
+# No embedder is baked in. Embedding is bge-m3 over HTTP (the `embedder`
+# container), and rag.core builds every collection with embedding_function=None,
+# so Chroma never reconstructs its default MiniLM and never downloads the 80MB
+# ONNX blob this image used to carry.
 
 COPY classifier ./classifier
 COPY mail ./mail
