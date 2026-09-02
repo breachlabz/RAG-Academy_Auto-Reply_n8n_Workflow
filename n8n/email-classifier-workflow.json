@@ -1,0 +1,74 @@
+{
+  "name": "Email Classifier",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "email-classifier-form",
+        "formTitle": "Email Classifier",
+        "formDescription": "Paste an email below and submit to detect its type.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "email",
+              "fieldType": "textarea",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "form-trigger",
+      "name": "Email form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "email-classifier-form"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://classifier:8100/answer",
+        "sendBody": true,
+        "contentType": "json",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "={{ $json.email }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http-classify",
+      "name": "Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 0],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "completionTitle": "=Detected type: {{ $json.type }}",
+        "completionMessage": "={{ $json.reply ? (\"Subject: \" + $json.subject + \"\\n\\n\" + $json.reply) : \"No auto-reply was generated.\" }}\n\n———\nType: {{ $json.type }}   Route: {{ $json.route }}\nacademic {{ $json.probs ? $json.probs.academic : \"n/a\" }} · administrative {{ $json.probs ? $json.probs.administrative : \"n/a\" }} · spam {{ $json.probs ? $json.probs.spam : \"n/a\" }}\n{{ $json.answered ? \"Answered from: \" + $json.sources.join(\" | \") : \"(not auto-answered — \" + $json.reason + \"; goes to the human queue)\" }}",
+        "options": {}
+      },
+      "id": "form-result",
+      "name": "Show result",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 1,
+      "position": [480, 0]
+    }
+  ],
+  "connections": {
+    "Email form": {
+      "main": [[{ "node": "Classify", "type": "main", "index": 0 }]]
+    },
+    "Classify": {
+      "main": [[{ "node": "Show result", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {},
+  "active": false
+}

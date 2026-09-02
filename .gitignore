@@ -1,0 +1,8 @@
+.env
+.venv/
+# data/* rather than data/, so the negation below can take effect -- git does
+# not descend into an excluded directory to un-exclude a child.
+data/*
+!data/docs/
+__pycache__/
+*.pyc
