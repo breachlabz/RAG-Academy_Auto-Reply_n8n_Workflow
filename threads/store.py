@@ -71,6 +71,9 @@ CREATE TABLE IF NOT EXISTS exchanges (
     query            TEXT NOT NULL,
     query_subject    TEXT NOT NULL DEFAULT '',
     message_id       TEXT,
+    -- Graph message id of the inbound email (Prepare's `ref`). Carried on the
+    -- row so the review queue can reply to the right message without n8n.
+    ref              TEXT,
     -- NULL until record_reply fills these in. A row with reply IS NULL is a
     -- question that has not been answered yet.
     reply            TEXT,
@@ -78,6 +81,15 @@ CREATE TABLE IF NOT EXISTS exchanges (
     grounded         INTEGER,
     created_at       TEXT NOT NULL,
     replied_at       TEXT,
+    -- One-line gist of `query`, generated lazily the first time the review
+    -- queue lists this row, then cached here so it is never regenerated.
+    query_gist       TEXT,
+    -- Set once a human has reviewed and sent the reply from the review queue.
+    -- `edited_reply` is what was actually sent -- equal to `reply` when the
+    -- human sent it unchanged, different when they edited it first.
+    edited_reply     TEXT,
+    sent             INTEGER NOT NULL DEFAULT 0,
+    sent_at          TEXT,
     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
 );
 
@@ -89,6 +101,30 @@ CREATE INDEX IF NOT EXISTS exchanges_by_thread
 CREATE UNIQUE INDEX IF NOT EXISTS exchanges_dedupe
     ON exchanges (message_id) WHERE message_id IS NOT NULL;
 """
+
+# Columns added after the original schema shipped. SQLite has no
+# `ADD COLUMN IF NOT EXISTS`, so `connect()` checks `table_info` and adds
+# whatever is missing -- lets an existing threads.db pick these up in place
+# rather than needing a reset.
+_ADDED_COLUMNS = {
+    "ref": "TEXT",
+    "query_gist": "TEXT",
+    "edited_reply": "TEXT",
+    "sent": "INTEGER NOT NULL DEFAULT 0",
+    "sent_at": "TEXT",
+    # n8n's `$execution.resumeUrl` for the Wait node paused on this reply --
+    # POSTing here lets /review/{id}/send resume that execution once a human
+    # approves. NULL for rows recorded before this existed, or by a caller
+    # that never waits on review (e.g. the one-call /generate-reply path).
+    "resume_url": "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(exchanges)")}
+    for column, decl in _ADDED_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE exchanges ADD COLUMN {column} {decl}")
 
 
 @dataclass
@@ -126,6 +162,7 @@ def connect(path: pathlib.Path | None = None):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     try:
         yield conn
         conn.commit()
@@ -184,6 +221,7 @@ def record_inbound(
     *,
     subject: str = "",
     message_id: str | None = None,
+    ref: str | None = None,
     path: pathlib.Path | None = None,
 ) -> bool:
     """Open a new turn for an arriving email. False if message_id was already stored.
@@ -191,15 +229,20 @@ def record_inbound(
     The caller is expected to branch on the return value: a False means the
     trigger delivered something already handled, and drafting a second reply to
     it would put two drafts in the mailbox for one email.
+
+    `ref` is Graph's message id for this email (Prepare's `ref`), stored so the
+    review queue can send a reply to the right message without going back
+    through n8n.
     """
     ensure_conversation(conversation_id, subject, path=path)
     with connect(path) as conn:
         try:
             conn.execute(
                 """INSERT INTO exchanges
-                       (conversation_id, query, query_subject, message_id, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (conversation_id, body, subject or "", message_id, _now()),
+                       (conversation_id, query, query_subject, message_id, ref,
+                        created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (conversation_id, body, subject or "", message_id, ref, _now()),
             )
         except sqlite3.IntegrityError:
             return False  # exchanges_dedupe fired: same internetMessageId.
@@ -212,6 +255,7 @@ def record_reply(
     *,
     subject: str = "",
     grounded: bool = False,
+    resume_url: str | None = None,
     path: pathlib.Path | None = None,
 ) -> None:
     """Fill in the reply half of the most recently opened, still-unanswered turn.
@@ -221,18 +265,22 @@ def record_reply(
     this codebase records the inbound and then, once it has an answer, records
     the reply before handling anything else for that conversation, so "the most
     recent unanswered row" is always the one this reply belongs to.
+
+    `resume_url` is n8n's `$execution.resumeUrl` for the Wait node paused
+    right after this reply was recorded, when the caller is that workflow.
     """
     ensure_conversation(conversation_id, subject, path=path)
     with connect(path) as conn:
         conn.execute(
             """UPDATE exchanges
-                  SET reply = ?, reply_subject = ?, grounded = ?, replied_at = ?
+                  SET reply = ?, reply_subject = ?, grounded = ?, replied_at = ?,
+                      resume_url = ?
                 WHERE id = (
                     SELECT id FROM exchanges
                      WHERE conversation_id = ? AND reply IS NULL
                      ORDER BY id DESC LIMIT 1
                 )""",
-            (body, subject or "", int(grounded), _now(), conversation_id),
+            (body, subject or "", int(grounded), _now(), resume_url, conversation_id),
         )
 
 
@@ -308,3 +356,88 @@ def conversations(*, path: pathlib.Path | None = None) -> list[dict]:
                 ORDER BY c.updated_at DESC"""
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+# --- Review queue -------------------------------------------------------
+#
+# A grounded exchange (an AI-drafted reply that passed the grounding net) sits
+# here, unsent, until a human reviews it in the review UI and sends it.
+# `grounded=1 AND reply IS NOT NULL AND sent=0` is the queue -- no separate
+# status column, because those three fields already say everything: not yet
+# answered, answered but not grounded (never enters review), or grounded and
+# waiting.
+
+
+def pending_review(*, path: pathlib.Path | None = None) -> list[dict]:
+    """Grounded replies not yet sent, oldest first (first drafted, first reviewed)."""
+    with connect(path) as conn:
+        rows = conn.execute(
+            """SELECT e.*, c.subject AS conversation_subject
+                 FROM exchanges e
+                 JOIN conversations c USING (conversation_id)
+                WHERE e.grounded = 1 AND e.reply IS NOT NULL AND e.sent = 0
+                ORDER BY e.id"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def sent_history(
+    *, limit: int = 50, path: pathlib.Path | None = None
+) -> list[dict]:
+    """Already-sent replies, most recently sent first. For the review page's
+    History section -- a record of what actually went out and whether it was
+    edited before sending (`edited_reply` vs the original `reply`)."""
+    with connect(path) as conn:
+        rows = conn.execute(
+            """SELECT e.*, c.subject AS conversation_subject
+                 FROM exchanges e
+                 JOIN conversations c USING (conversation_id)
+                WHERE e.sent = 1
+                ORDER BY e.sent_at DESC
+                LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_exchange(exchange_id: int, *, path: pathlib.Path | None = None) -> dict | None:
+    with connect(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM exchanges WHERE id = ?", (exchange_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_query_gist(
+    exchange_id: int, gist: str, *, path: pathlib.Path | None = None
+) -> None:
+    """Cache the one-line query summary so it is generated at most once."""
+    with connect(path) as conn:
+        conn.execute(
+            "UPDATE exchanges SET query_gist = ? WHERE id = ?", (gist, exchange_id)
+        )
+
+
+def mark_sent(
+    exchange_id: int, edited_reply: str, *, path: pathlib.Path | None = None
+) -> dict | None:
+    """Record the human-approved final text and take the row out of the queue.
+
+    Only fires on a row that is still actually pending -- `sent = 0` in the
+    WHERE clause makes this idempotent (a retried request cannot flip an
+    already-sent row) and lets the caller tell "sent" from "already sent" by
+    checking whether a row was updated. Returns the row as it stood *before*
+    this call so the caller (about to place the real Graph send) still has
+    `ref` and `conversation_id` even though the row is now marked sent.
+    """
+    row = get_exchange(exchange_id, path=path)
+    if row is None or row["sent"]:
+        return None
+    with connect(path) as conn:
+        conn.execute(
+            """UPDATE exchanges
+                  SET edited_reply = ?, sent = 1, sent_at = ?
+                WHERE id = ? AND sent = 0""",
+            (edited_reply, _now(), exchange_id),
+        )
+    return row

@@ -74,6 +74,18 @@ services:
       # literal \n in the value becomes a line break.
       - RAG_EMAIL_GREETING=${RAG_EMAIL_GREETING:-Hello,}
       - RAG_EMAIL_SIGNOFF=${RAG_EMAIL_SIGNOFF:-Best regards,\nThe Training Team}
+      # --- review queue send (Graph, app-only) -- see .env.example ---------
+      # Unset by default: the review queue at /review still works without
+      # these, Send just returns a clear "not configured" error instead of
+      # sending. Fill in .env once the Azure app registration exists.
+      - GRAPH_TENANT_ID=${GRAPH_TENANT_ID:-}
+      - GRAPH_CLIENT_ID=${GRAPH_CLIENT_ID:-}
+      - GRAPH_CLIENT_SECRET=${GRAPH_CLIENT_SECRET:-}
+      - GRAPH_MAILBOX=${GRAPH_MAILBOX:-}
+      # UI-testing only: set to 1 in .env to make /review/{id}/send skip the
+      # real Graph call (still writes the DB row as sent). Unset/0 for real
+      # use -- see api.py's REVIEW_DRY_RUN.
+      - REVIEW_DRY_RUN=${REVIEW_DRY_RUN:-}
       # --- everything below is in-compose wiring, do not touch ------------
       - RAG_CHROMA_HOST=chromadb
       - RAG_CHROMA_PORT=8000
@@ -115,16 +127,23 @@ services:
     environment:
       - N8N_SECURE_COOKIE=false
       - N8N_RUNNERS_ENABLED=true
-      # Everything stays on localhost. n8n is loopback-only (see ports below),
-      # the Outlook workflow is a polling trigger with no inbound webhook or
-      # form, and Microsoft Entra only accepts an https:// or http://localhost
-      # OAuth redirect -- so localhost is also what makes the Outlook sign-in
-      # work. Reach the UI through an SSH tunnel.
+      # Editor/OAuth stays on localhost. n8n is loopback-only (see ports
+      # below), and Microsoft Entra only accepts an https:// or
+      # http://localhost OAuth redirect -- so localhost is what makes the
+      # Outlook sign-in work (and is what the UI itself is reached at, over
+      # an SSH tunnel). N8N_HOST/N8N_PROTOCOL/N8N_EDITOR_BASE_URL drive that
+      # and stay as localhost.
       - N8N_HOST=localhost
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
-      - WEBHOOK_URL=http://localhost:5678/
       - N8N_EDITOR_BASE_URL=http://localhost:5678/
+      # WEBHOOK_URL is different: it's what n8n bakes into generated webhook
+      # URLs, e.g. $execution.resumeUrl for the Academy Agent workflow's
+      # "Wait for review" node -- and that one gets POSTed to by the
+      # classifier container (mail/graph.py's review_send()), not by a
+      # browser. "localhost" there resolves to the classifier container
+      # itself, not n8n, so it must be the docker-network service name.
+      - WEBHOOK_URL=http://n8n:5678/
     ports:
       # Loopback only: n8n executes arbitrary code, so never expose it on a
       # shared network. Reach it with an SSH tunnel from your workstation:

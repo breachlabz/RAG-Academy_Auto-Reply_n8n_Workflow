@@ -11,15 +11,24 @@ n8n cannot import the Python module, so it talks to this over HTTP instead.
     POST /threads/reply   {"conversation_id": ..., "reply": ...}  -> record it
     GET  /threads         list stored conversations
     GET  /threads/{id}    one conversation's turns (query/reply pairs)
+    GET  /review          the review queue UI (open this in a browser)
+    GET  /review/queue    grounded replies awaiting review, as JSON
+    GET  /review/history  already-sent replies, most recent first, as JSON
+    POST /review/{id}/send  {"reply": "..."}  -> send it (Graph) and record it
     GET  /health
 
 /emails/prepare and /emails/finalize are /generate-reply split in two, for the
 Academy Agent (Outlook) workflow: it runs retrieval and drafting as an n8n AI
 Agent node with its own Chroma tool rather than inside the endpoint, so prepare
 does classify + gate + query rewrite, the agent drafts, finalize grounds the
-result, and /threads/reply records it once the Outlook draft exists. The gate
-still lives server-side -- prepare returns proceed=false for anything not routed
-to rag, so the agent is never reached for it.
+result, and /threads/reply records it. The gate still lives server-side --
+prepare returns proceed=false for anything not routed to rag, so the agent is
+never reached for it.
+
+/threads/reply is the workflow's last node now -- there is no Outlook Draft
+step. A grounded reply lands in the review queue (/review) instead: a human
+reads it, edits it if needed, and Send calls Graph directly (mail/graph.py) to
+actually send it, then records the sent text back onto the row.
 
 /answer and /generate-reply are the same pipeline; the difference is memory.
 /answer is stateless and stays that way -- it is what the test form calls and
@@ -40,19 +49,43 @@ In compose:   see docker-compose.yml (talks to the chat model and chroma by name
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+import os
+import pathlib
+
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from classifier import DEFAULT_THRESHOLD, classify, route
+from mail import graph as mail_graph
 from mail import to_plain_text
 from rag import answer as rag_answer
 from rag import resolve_format
 from rag.core import EMAIL_SUBJECT, format_email, ground
 from rag.format_hint import as_bullets, wants_list
 from threads import context as thread_context
+from threads import gist as thread_gist
 from threads import store as thread_store
 
 app = FastAPI(title="Email Classifier")
+
+# The review queue is a Next.js app (frontend/), built with `output: "export"`
+# (see frontend/next.config.js) into frontend/out/ -- plain static HTML/CSS/JS,
+# no Node server runs at runtime. `basePath: "/review"` in that config makes
+# every asset URL Next emits already start with /review/_next/..., matching
+# the mount below; api.py only ever hands out the prebuilt files.
+_REVIEW_DIST = pathlib.Path(__file__).resolve().parent / "frontend" / "out"
+# check_dir=False: frontend/out/ does not exist until `npm run build` has run
+# (README §X / Dockerfile's frontend-build stage). Without this, importing
+# api.py before that build ever happened -- a fresh checkout, a test runner --
+# would crash on startup instead of just 404ing the review page.
+app.mount(
+    "/review/_next",
+    StaticFiles(directory=_REVIEW_DIST / "_next", check_dir=False),
+    name="review-assets",
+)
 
 # "Detect the type" wants one label, but the classifier returns three
 # independent flags. Collapse by priority: a payment issue outranks a course
@@ -124,8 +157,9 @@ class PrepareRequest(BaseModel):
 
     `body` is the message body straight from Graph (HTML unless `is_html` is
     false); the endpoint strips markup and quoted history the same way
-    `/generate-reply` does. `ref` is Graph's message id, carried through
-    untouched so the draft step can address `/messages/{ref}/createReply`.
+    `/generate-reply` does. `ref` is Graph's message id, stored on the
+    exchange row (`thread_store.record_inbound`) so the review queue's Send
+    can later call `/messages/{ref}/reply` -- see mail/graph.py.
     `conversation_id` should be Outlook's conversationId -- absent, the thread
     store falls back to a subject-derived key. `message_id` should be the
     internetMessageId: it is what makes a re-fired trigger idempotent.
@@ -166,6 +200,9 @@ class RecordReplyRequest(BaseModel):
     reply: str
     subject: str = ""
     grounded: bool = True
+    # n8n's `$execution.resumeUrl` for the Wait node paused right after this
+    # call, when the caller is the Academy Agent workflow. See review_send().
+    resume_url: str | None = None
 
 
 @app.get("/health")
@@ -401,8 +438,9 @@ def prepare_email(req: PrepareRequest) -> dict:
     Everything the workflow's later nodes read off the `Prepare` item is
     returned here: `proceed` (the gate the "Is label Academy?" node branches
     on), `history` / `email_text` / `query` / `format` (the agent's prompt),
-    and `subject` / `conversation_id` / `ref` (carried through to finalize, the
-    thread record, and the Graph createReply call).
+    and `subject` / `conversation_id` / `ref` (carried through to finalize and
+    the thread record; `ref` ends up on the stored exchange row for the
+    review queue's Graph reply call later).
 
     `format` is `"list"` or `"prose"`, decided from the enquirer's own wording
     the same way `/answer` decides it (`rag.format_hint.wants_list`). The agent
@@ -417,7 +455,7 @@ def prepare_email(req: PrepareRequest) -> dict:
     block, prior = thread_context.load(key)
 
     fresh = thread_store.record_inbound(
-        key, email_text, subject=req.subject, message_id=req.message_id
+        key, email_text, subject=req.subject, message_id=req.message_id, ref=req.ref
     )
 
     # Classified against `block` -- the thread before this email -- so a
@@ -508,7 +546,11 @@ def record_thread_reply(req: RecordReplyRequest) -> dict:
     """
     key = thread_store.thread_key(req.conversation_id, req.subject)
     thread_store.record_reply(
-        key, req.reply, subject=req.subject, grounded=req.grounded
+        key,
+        req.reply,
+        subject=req.subject,
+        grounded=req.grounded,
+        resume_url=req.resume_url,
     )
     return {"ok": True, "conversation_id": key}
 
@@ -538,4 +580,111 @@ def get_thread(conversation_id: str) -> dict:
             }
             for e in exchanges
         ],
+    }
+
+
+# --- Review queue -------------------------------------------------------
+#
+# The human-in-the-loop step that replaces the Outlook-draft-then-manually-
+# send flow. `Record reply` (/threads/reply above) already writes a grounded
+# reply onto its exchange row; this is what surfaces those rows to a person,
+# and what actually sends once they approve -- through mail.graph, not
+# through n8n, since the Outlook OAuth2 credential the workflow would have
+# used is not set up. See mail/graph.py for why that is a *separate*
+# app-only credential rather than the same one.
+
+
+class SendReplyRequest(BaseModel):
+    """`/review/{id}/send` -- the reviewer's final text for one exchange."""
+
+    reply: str
+
+
+@app.get("/review")
+def review_page() -> FileResponse:
+    return FileResponse(_REVIEW_DIST / "index.html")
+
+
+@app.get("/review/queue")
+def review_queue() -> dict:
+    """Grounded replies waiting for a human. Query gists are generated (and
+    cached) here, lazily, rather than at draft time -- every email would
+    otherwise pay for a summary even when the classifier gate or the
+    grounding net was always going to keep it out of this queue."""
+    pending = thread_store.pending_review()
+    for row in pending:
+        if not row.get("query_gist"):
+            row["query_gist"] = thread_gist.summarize_query(row["query"])
+            thread_store.set_query_gist(row["id"], row["query_gist"])
+    # Surfaced so the page can show a persistent "not really sending" banner
+    # the whole time REVIEW_DRY_RUN is on, not just after someone clicks Send.
+    return {"pending": pending, "dry_run": REVIEW_DRY_RUN}
+
+
+@app.get("/review/history")
+def review_history() -> dict:
+    """Already-sent replies, most recent first -- the page's History section."""
+    return {"history": thread_store.sent_history()}
+
+
+# UI-only testing escape hatch: skip the real Graph call so the queue/edit/
+# Send flow (and the DB write it makes) can be exercised without GRAPH_* set
+# up, and without sending real mail while that's being tested. Off by
+# default -- REVIEW_DRY_RUN must be explicitly set to turn it on, and every
+# dry-run response says so (`dry_run: true`), so it is never mistaken for a
+# real send in the UI or in a log. Remove/unset it once you're done testing.
+REVIEW_DRY_RUN = os.environ.get("REVIEW_DRY_RUN", "").lower() in ("1", "true", "yes")
+
+
+@app.post("/review/{exchange_id}/send")
+def review_send(exchange_id: int, req: SendReplyRequest) -> dict:
+    """Send the reviewer's (possibly edited) reply for real, then record it.
+
+    The Graph call comes first, on the row still in the queue: a failed send
+    leaves the row exactly where it was, so the reviewer sees the error and
+    can retry, rather than the row silently vanishing without the mail having
+    gone anywhere. Only a successful send marks it sent.
+
+    Skipped entirely when REVIEW_DRY_RUN is set -- see the comment above.
+    """
+    row = thread_store.get_exchange(exchange_id)
+    if row is None:
+        raise HTTPException(404, "no such exchange")
+    if not row["grounded"] or row["reply"] is None:
+        raise HTTPException(409, "this exchange has no AI reply to review")
+    if row["sent"]:
+        raise HTTPException(409, "already sent")
+
+    reply = req.reply.strip()
+    if not reply:
+        raise HTTPException(422, "reply cannot be empty")
+
+    if not REVIEW_DRY_RUN:
+        try:
+            mail_graph.send_reply(row["ref"], reply)
+        except mail_graph.GraphNotConfigured as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except mail_graph.GraphSendError as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    thread_store.mark_sent(exchange_id, reply)
+
+    # Resume the n8n execution that's been paused (Wait node, webhook resume)
+    # since Record reply, if this exchange came from that workflow. Best
+    # effort only -- the mail is already sent by this point, which is what
+    # actually matters; a stale/expired/unreachable resume URL (n8n
+    # restarted, the 14-day cap already fired, ...) must never turn a
+    # successful send into a failed response.
+    resume_url = row["resume_url"]
+    if resume_url:
+        try:
+            requests.post(resume_url, timeout=10)
+        except requests.RequestException as exc:
+            print(f"review_send: resume call to n8n failed for {exchange_id}: {exc}")
+
+    return {
+        "ok": True,
+        "id": exchange_id,
+        "sent_via_graph": not REVIEW_DRY_RUN,
+        "dry_run": REVIEW_DRY_RUN,
     }

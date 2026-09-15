@@ -10,3 +10,9 @@ scripts
 docker-compose*.yml
 __pycache__
 *.pyc
+# frontend/ is built fresh inside the frontend-build stage (npm install, then
+# npm run build) -- copying a host node_modules/out in would risk a
+# platform-mismatched native module or a stale build shadowing the real one.
+frontend/node_modules
+frontend/out
+frontend/.next

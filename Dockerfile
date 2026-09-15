@@ -1,3 +1,15 @@
+# --- stage 1: build the review queue (Next.js, static export) -------------
+# A separate stage so the final image never carries Node, npm, or
+# node_modules -- only the plain HTML/CSS/JS output. See frontend/next.config.js
+# (output: "export") and api.py's _REVIEW_DIST for how it's served.
+FROM node:20-slim AS frontend-build
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ .
+RUN npm run build
+
+# --- stage 2: the classifier API + the built review queue -----------------
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -15,6 +27,7 @@ COPY mail ./mail
 COPY rag ./rag
 COPY threads ./threads
 COPY api.py .
+COPY --from=frontend-build /app/frontend/out ./frontend/out
 
 # data/ is NOT copied -- it is bind-mounted from the host by compose. The
 # thread database lives there, and a copy baked into the image would be

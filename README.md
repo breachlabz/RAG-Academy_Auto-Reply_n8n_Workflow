@@ -6,13 +6,14 @@ An assistant that watches an Outlook mailbox and, for each incoming email:
 2. For academic-only email, **retrieves** the relevant passages from a set of
    Word documents about the training programmes and **drafts a reply grounded
    in them** — nothing else.
-3. Saves that reply as an **Outlook draft** in the same conversation. A human
-   reviews and sends it.
+3. Queues that reply in the **review page** (`/review`) for a human to read,
+   optionally edit, and send. Nothing goes out until a person clicks Send.
 
 Anything about payments, records, refunds or account issues — and anything the
 classifier is not confident about, or that the documents do not answer — gets
-**no draft** and is left for a human. **The system never sends mail.** It only
-creates drafts.
+**no draft** and is left for a human. **Nothing sends automatically.** Every
+reply this system produces waits in the review queue for an explicit human
+Send.
 
 This is the single reference for deploying and running it. Follow it top to
 bottom.
@@ -25,21 +26,29 @@ bottom.
                     ┌───────────────────── this docker compose ─────────────────────┐
                     │                                                               │
   Outlook mailbox ──┼──▶ n8n ──▶ classifier API ──┬──▶ chromadb   (vector store)    │
-       ▲            │            (FastAPI :8100)  └──▶ embedder   (bge-m3, CPU)      │
-       │            │              │        ▲                                        │
-   draft created ◀──┼──────────────┘        │  the n8n AI Agent node also retrieves  │
-                    │                       │  + drafts, via its own Chroma tool     │
-                    └───────────────────────┼───────────────────────────────────────┘
-                                            │
-                                            ▼
-                          your chat model  (LiteLLM or Ollama)
-                               already running, elsewhere
+                    │            (FastAPI :8100)  └──▶ embedder   (bge-m3, CPU)      │
+                    │              │        ▲                                        │
+                    │              │        │  the n8n AI Agent node also retrieves  │
+                    │              ▼        │  + drafts, via its own Chroma tool     │
+                    │      review queue                                              │
+                    │      (/review, a human reads/edits/sends)                      │
+                    └──────────────┼────────┼───────────────────────────────────────┘
+                                   │        │
+                                   ▼        ▼
+                    Microsoft Graph      your chat model  (LiteLLM or Ollama)
+                    (app-only, Send)          already running, elsewhere
+                                   │
+                                   ▼
+                            Outlook mailbox (sent)
 ```
 
 Four containers come up: `n8n`, `classifier`, `chromadb`, `embedder`. All
 publish on `127.0.0.1` only. The **chat model is yours** — an existing LiteLLM
 or Ollama endpoint named once in `.env`; this project adds no model of its own
 and needs no GPU. It runs one small CPU embedding model (`bge-m3`) locally.
+Sending is a separate, app-only Microsoft Graph credential the review page
+calls directly (§6e) — independent of the n8n Outlook connection, which only
+needs to *read* the mailbox now.
 
 ### The pipeline, node by node
 
@@ -48,22 +57,26 @@ API. The safety logic (the gate, the refusal detection, the email shell) lives
 in the API and only there.
 
 ```
-New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Agent ─▶ Finalize ─▶ Grounded answer? ─true─▶ Outlook Draft ─▶ Record reply
- (polls inbox/min)   POST         ($json.proceed)          (drafts from    POST        ($json.grounded)      Graph            POST
-                     /emails/                               academy_docs)  /emails/                          createReply      /threads/reply
-                     prepare                                               finalize                          (a DRAFT,
-                                   └─false─▶ Do nothing                    └──────────────false─▶ Human queue  never sends)
+New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Agent ─▶ Finalize ─▶ Grounded answer? ─true─▶ Record reply
+ (polls inbox/min)   POST         ($json.proceed)          (drafts from    POST        ($json.grounded)      POST
+                     /emails/                               academy_docs)  /emails/                          /threads/reply
+                     prepare                                               finalize                          (queues it for
+                                   └─false─▶ Do nothing                    └──────────────false─▶ Human queue  /review)
 ```
+
+The workflow's last node is **Record reply** — n8n's job ends once the reply is
+recorded. A human takes it from there at **`/review`** (§6e): read it, edit it
+if needed, click **Send**. That call goes straight from the classifier API to
+Microsoft Graph, not back through n8n.
 
 | Node | Does |
 |---|---|
-| **Prepare** → `POST /emails/prepare` | strips HTML + quoted history, records the inbound message (deduplicated on `internetMessageId`), loads the thread, runs the **classifier gate**, and rewrites a follow-up into a standalone retrieval question. Returns `proceed` (the gate), `history` / `email_text` / `query` / `format` (the agent's prompt), and `ref` (the Graph message id). |
+| **Prepare** → `POST /emails/prepare` | strips HTML + quoted history, records the inbound message (deduplicated on `internetMessageId`), loads the thread, runs the **classifier gate**, and rewrites a follow-up into a standalone retrieval question. Returns `proceed` (the gate), `history` / `email_text` / `query` / `format` (the agent's prompt), and `ref` (the Graph message id, carried onto the stored row for `/review` to reply to later). |
 | **Is label "Academy"?** | branches on `proceed`. False → *Do nothing* (payments, spam, low confidence, or a duplicate). |
 | **AI Agent — generate reply** | an n8n LangChain agent with the `academy_docs` Chroma tool. Must search the docs before answering; replies with the bare token `NOT_IN_DOCUMENTS` when they do not cover the question. Uses `format` to pick a bulleted or prose reply. Writes the body only — no greeting or sign-off. |
 | **Finalize** → `POST /emails/finalize` | runs the agent's output through the grounding net (rejects a bare/embedded `NOT_IN_DOCUMENTS` and prose that merely *reports the documents as silent*), then wraps a grounded body in the greeting/sign-off shell. Returns `grounded` and the ready-to-send `reply`. |
 | **Grounded answer?** | branches on `grounded`. False → *Human queue*. |
-| **Outlook Draft** → Graph `createReply` | creates a **draft** reply in the original conversation. Never sends. |
-| **Record reply** → `POST /threads/reply` | records the drafted reply against the conversation, so the next email in the thread has its history. |
+| **Record reply** → `POST /threads/reply` | records the drafted reply against the conversation (so the next email in the thread has its history) and puts the row in the **review queue** — it now sits at `/review` until a human sends it. |
 
 ---
 
@@ -237,8 +250,11 @@ curl -s http://<endpoint>/v1/chat/completions \
 5. **Certificates & secrets** → **New client secret** → copy the **Value** now
    (hidden after you leave the page).
 6. **API permissions** → **Add a permission** → **Microsoft Graph** →
-   **Delegated** → add **`Mail.ReadWrite`** and **`offline_access`**. Click
+   **Delegated** → add **`Mail.Read`** and **`offline_access`**. Click
    **Grant admin consent** if your tenant shows it.
+   (Only *read* — this app registration polls the inbox. It no longer needs
+   write access: nothing in n8n creates a draft or sends any more. Sending is
+   a separate, app-only registration — §6e.)
 
 ### 6b. Open the n8n UI
 
@@ -278,7 +294,7 @@ pipeline runs headless — no tunnel, no browser.
 
 1. **Workflows → ⋯ → Import from File** → `n8n/academy-agent-workflow.json`.
 2. Attach credentials where nodes show a warning:
-   - **New Outlook email** and **Outlook Draft** → the Outlook credential.
+   - **New Outlook email** → the Outlook credential.
    - **Local Model** and **Embeddings bge-m3** → the chat-model credential.
    - **academy_docs** → the Chroma credential.
 3. Optionally open **New Outlook email** to set folder / poll interval
@@ -292,6 +308,44 @@ it the same way; it needs no credentials.
 > **Re-importing overwrites credential bindings and the active flag.** Re-attach
 > and re-activate after any import.
 
+### 6e. Set up sending (the review queue)
+
+The workflow above only gets a reply as far as the **review queue**
+(`http://127.0.0.1:8100/review`) — nothing sends on its own. Opening that page
+without going further is fine: you can read and edit drafts, the **Send**
+button will just fail clearly ("not configured") until this step is done.
+
+Sending needs its own Microsoft Graph credential — deliberately **not** the
+Outlook OAuth2 credential from §6a. That one is *delegated*: it only works
+because a person signed in interactively, which is exactly what a background
+Send button cannot wait on. This is an **app-only** registration instead — it
+authenticates as itself, with a client id/secret, no sign-in ever:
+
+1. [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** → **App
+   registrations** → **New registration**. A second, separate app from §6a
+   (e.g. `academy-email-send`) — do not reuse that one or add these
+   permissions to it.
+2. **API permissions** → **Add a permission** → **Microsoft Graph** →
+   **Application permissions** → add **`Mail.Send`** → **Grant admin
+   consent** (a tenant admin must click this; application permissions have no
+   per-user consent).
+3. **Certificates & secrets** → **New client secret** → copy the **Value**
+   now.
+4. Copy the **Application (client) ID** and **Directory (tenant) ID** from
+   **Overview**.
+5. In `.env`:
+   ```ini
+   GRAPH_TENANT_ID=<Directory (tenant) ID>
+   GRAPH_CLIENT_ID=<Application (client) ID>
+   GRAPH_CLIENT_SECRET=<the secret VALUE>
+   GRAPH_MAILBOX=<the mailbox's sign-in email, e.g. training@yourorg.com>
+   ```
+6. `docker compose up -d` to pick up the new values.
+
+Reopen `/review` and Send should work. `mail/graph.py` is the whole
+implementation — about eighty lines, nothing more happens on the way to
+Graph.
+
 ---
 
 ## 7. Verify end to end
@@ -301,15 +355,17 @@ Send a test email to the mailbox:
 > Subject: *Course question* — Body: *What are the training levels and who is
 > Level 2 aimed at?*
 
-Within ~1–2 minutes a **draft reply** appears in that conversation listing the
-levels, drawn from the documents; the n8n execution ends at **Record reply**.
+Within ~1–2 minutes a **row appears at `/review`** listing the levels, drawn
+from the documents, with your edit box pre-filled; the n8n execution ends at
+**Record reply**. Edit it or not, then click **Send** (§6e must be done first)
+— the reply goes out via Graph and the row leaves the queue.
 
-Then send: *My invoice still shows unpaid, can you check?* → **no draft**, the
-execution ends at **Do nothing** (`reason: not routed to rag`). Correct —
-billing is never auto-answered.
+Then send: *My invoice still shows unpaid, can you check?* → **nothing in the
+queue**, the execution ends at **Do nothing** (`reason: not routed to rag`).
+Correct — billing is never auto-answered.
 
-If the first test produced no draft, open the failing execution and read the
-node output:
+If the first test produced no queue row, open the failing execution and read
+the node output:
 
 | Where it stops / `reason` | Meaning | Fix |
 |---|---|---|
@@ -319,7 +375,7 @@ node output:
 | **Do nothing**, `reason: not routed to rag` on an academic email | gate said human | check `flags`/`probs` in the Prepare output; raise nothing, the gate is conservative by design |
 | **Do nothing**, `reason: already handled (duplicate message_id)` | same email seen before | expected on a re-poll; send a fresh email |
 | **Human queue** | classified academic, but the agent found no grounded answer | re-run `ingest --reset` (§4); confirm the topic is in `data/docs/`; on Ollama check context length (§5b) |
-| draft appears, `"calibrated": false` | flag-only mode (§5a) | expected on Ollama without logprobs |
+| row appears in `/review`, `"calibrated": false` | flag-only mode (§5a) | expected on Ollama without logprobs |
 
 ---
 
@@ -340,6 +396,9 @@ then `docker compose up -d`. A literal `\n` becomes a line break.
 
 **Gate strictness** — `EC_THRESHOLD` in `.env` (default `0.9`; higher → more
 email to a human).
+
+**Review and send replies** — `http://127.0.0.1:8100/review`. Every grounded
+reply waits there until a human sends it (§6e); nothing sends on its own.
 
 **Reply format** — automatic: a numbered/bulleted enquiry, an "in points" ask,
 or several questions produces a `- ` list; otherwise prose. `Prepare` decides
@@ -397,8 +456,16 @@ reach n8n as exactly `http://localhost:5678` (via the SSH tunnel), and the
 Entra redirect URI must match `http://localhost:5678/rest/oauth2-credential/callback`
 character for character.
 
-**Workflow runs, `grounded: true`, but no draft** — the **Outlook Draft** node
-is missing the Outlook credential (a separate attachment from the trigger).
+**Workflow runs, `grounded: true`, but nothing shows at `/review`** — check
+`docker compose logs classifier` around the `Record reply` call; a reply is
+only queued once `/threads/reply` has actually recorded it. If it's there but
+**Send** fails with *"not configured"*, §6e hasn't been done yet — that's
+expected, not a bug, until `GRAPH_*` is set in `.env`.
+
+**Send fails with a 502 from Graph** — the row stays in the queue (nothing is
+lost) and the error in the page names what Graph rejected. Common causes: the
+app registration's `Mail.Send` permission was added but admin consent was
+never granted, or `GRAPH_MAILBOX` isn't a real mailbox in the tenant.
 
 **Container logs** — `docker compose logs -f classifier` (or `n8n`, `embedder`,
 `chromadb`).
@@ -418,8 +485,11 @@ from the host. The safety logic lives here; the workflows are plumbing.
 | `POST /generate-reply` | `{"email_text", "conversation_id", "subject", "message_id"}` → the whole pipeline in one call, thread-aware. An alternative to the split `prepare`/`finalize` for a one-HTTP-node workflow. |
 | `POST /emails/prepare` | `{"body", "is_html", "subject", "conversation_id", "message_id", "ref"}` → `proceed`, `history`, `email_text`, `query`, `format`, `ref`, `duplicate`, `reason`. Front half of the Outlook path. |
 | `POST /emails/finalize` | `{"output", "conversation_id", "subject", "format"}` → `grounded`, `reply`, `subject`, `agent_output`, `reason`. Back half. |
-| `POST /threads/reply` | `{"conversation_id", "reply", "subject", "grounded"}` → records the drafted reply. |
+| `POST /threads/reply` | `{"conversation_id", "reply", "subject", "grounded"}` → records the drafted reply and, when grounded, queues it for review. |
 | `GET /threads` / `GET /threads/{id}` | stored conversations / one conversation's turns |
+| `GET /review` | the review queue page — open this in a browser |
+| `GET /review/queue` | `{"pending": [...]}` → grounded replies awaiting a human, with a cached one-line `query_gist` |
+| `POST /review/{id}/send` | `{"reply": "..."}` → sends it via Graph (§6e) and records the sent text. 503 if Graph isn't configured yet, 502 if Graph rejected it — either way the row stays queued so nothing is silently lost. |
 
 Notes:
 - **`type`** collapses the three flags by priority **spam > administrative >
@@ -529,16 +599,21 @@ hand-label the holdout, and set the production threshold against **real** mail.
 
 ```
 api.py                    the HTTP surface (classify / answer / generate-reply /
-                          emails.prepare / emails.finalize / threads.reply)
+                          emails.prepare / emails.finalize / threads.reply / review)
 classifier/core.py        classify() + route(), prompt and JSON schema
 classifier/__main__.py    CLI:  python -m classifier "…"
 rag/core.py               ingest() + retrieve() + answer(), embed(), chunking, grounding
 rag/docx_text.py          .docx -> markdown, plus verify() for extraction loss
 rag/format_hint.py        list-vs-prose decision + as_bullets() coercion
 rag/__main__.py           CLI:  python -m rag  {ingest | ask | check | manifest}
-threads/store.py          SQLite: conversations + turns, dedupe on message id
+threads/store.py          SQLite: conversations + turns, dedupe on message id, review queue
 threads/context.py        history block + standalone-question rewrite + rolling summary
+threads/gist.py           one-line query summary for the review queue, cached per row
 mail/text.py              html -> prose, and cutting the quoted reply
+mail/graph.py             app-only Microsoft Graph client -- the review queue's Send
+frontend/                 the review queue: a Next.js app, statically exported
+                          (`npm run build` -> frontend/out/) and served by
+                          api.py at /review -- no Node process at runtime
 n8n/academy-agent-workflow.json          the mailbox pipeline
 n8n/email-classifier-form-workflow.json  the optional manual test form
 data/docs/                source documents for the vector store
@@ -550,10 +625,20 @@ docker-compose.override.yml.example      per-host model-network wiring
 
 ## 14. Guarantees
 
-- Nothing in this stack **sends** email. The Outlook node calls `createReply`,
-  which creates a draft. Sending is a human action.
-- No container is reachable off `127.0.0.1`.
-- Administrative and spam email never receive an automated reply.
-- Every factual sentence in a draft comes from `data/docs/`. If the documents
+- **Nothing sends automatically.** Every grounded reply stops in the review
+  queue (`/review`); the only thing that sends it is a human clicking Send
+  there, optionally after editing it. Nothing in the classify/retrieve/draft
+  path (Prepare, the AI Agent, Finalize, Record reply) has network access to
+  Graph at all — only `POST /review/{id}/send`, and only when it is called,
+  ever reaches `mail/graph.py`.
+- A failed or not-yet-configured Send never gets recorded as sent. The row
+  stays in the queue and the human sees why, instead of the system silently
+  believing something went out that didn't (§9).
+- No container is reachable off `127.0.0.1`. The review page has no login of
+  its own — it inherits that same "trusted local network" boundary. Put it
+  behind real auth before exposing it any wider.
+- Administrative and spam email never receive an automated reply, and never
+  reach the review queue at all.
+- Every factual sentence in a reply comes from `data/docs/`. If the documents
   do not cover a question, the email goes to the human queue rather than
   getting a guessed answer.

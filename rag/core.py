@@ -231,13 +231,49 @@ def refuses_in_prose(text: str) -> bool:
     return bool(_SOURCE_WORD.search(opening) and _SOURCE_NEGATION.search(opening))
 
 
+# Floor on what a stripped remainder has to be, in `_strip_leading_refusal`,
+# to count as a real answer rather than a scrap not worth keeping. Not a
+# business rule -- just cheap insurance against keeping something like "OK."
+_MIN_SALVAGE_CHARS = 20
+
+
+def _strip_leading_refusal(text: str) -> str:
+    """Drop a leading sentence that opens with a refusal, keeping whatever
+    substantive content follows -- the mirror image of the trailing-token
+    strip in `ground()`, for the related-topic-answer shape the SYSTEM prompt
+    now asks for: a small model given "lead with the fact, caveat after"
+    reliably ignores the ordering and still opens with "The documentation
+    does not specify X for Level 3." even when the rest of the same reply is
+    a genuine, specific answer about a related level. That opening sentence
+    is exactly what `refuses_in_prose` is built to catch -- discarding the
+    whole reply over it throws away real content the same way the trailing
+    NOT_IN_DOCUMENTS case used to.
+
+    Iterates rather than stripping once: a model that leads with the refusal
+    sometimes restates it in a second sentence before actually answering.
+    Bounded automatically -- the SYSTEM prompt caps replies at a handful of
+    sentences, and each iteration must find `refuses_in_prose` still true or
+    it stops.
+    """
+    while text and refuses_in_prose(text):
+        sentences = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)
+        if len(sentences) < 2:
+            return ""  # The whole (single-sentence) reply was the refusal.
+        remainder = sentences[1].strip()
+        if len(remainder) < _MIN_SALVAGE_CHARS:
+            return ""
+        text = remainder
+    return text
+
+
 def ground(text: str) -> str:
     """Clean a model's answer and decide what, if anything, is grounded.
 
     Returns the text to use as the reply, or "" when nothing here is grounded.
     Three shapes all collapse to "": an empty reply, the reply being exactly
-    the bare NOT_IN_DOCUMENTS token as instructed, and a reply that opens with
-    a refusal phrased as prose (see `refuses_in_prose`).
+    the bare NOT_IN_DOCUMENTS token as instructed, and a reply that is
+    *entirely* a refusal phrased as prose (see `refuses_in_prose`) with
+    nothing substantive following it.
 
     A fourth shape is not a refusal, and used to be treated as one: a model
     facing a multi-part question that the documents mostly cover sometimes
@@ -247,6 +283,13 @@ def ground(text: str) -> str:
     grounded part in front of it is kept. A token that is not bare and not
     trailing -- buried mid-reply -- is not this shape, and is safer to discard
     whole than to guess which half is trustworthy.
+
+    A fifth shape is the mirror of the fourth: the SYSTEM prompt now asks for
+    a related-topic answer to lead with the fact and put any caveat after it,
+    but a small model often ignores that and opens with the refusal sentence
+    anyway even though real, on-topic content follows. `_strip_leading_refusal`
+    drops that opening sentence (or sentences) and keeps the rest, the same
+    salvage judgment as the trailing case, just at the other end of the reply.
     """
     text = text.strip()
     if not text or text == NO_ANSWER:
@@ -255,9 +298,9 @@ def ground(text: str) -> str:
         text = text[: -len(NO_ANSWER)].rstrip()
         if not text:
             return ""
-    if NO_ANSWER in text or refuses_in_prose(text):
+    if NO_ANSWER in text:
         return ""
-    return text
+    return _strip_leading_refusal(text)
 
 SYSTEM = f"""You answer enquiries about the training programmes described in
 the documentation extracts provided.
@@ -267,9 +310,31 @@ Rules:
   a price, a duration or a prerequisite that is not written in them. This
   applies especially to subjects you know about independently -- answering an
   automotive security question from your own knowledge rather than from the
-  extracts is the failure this system exists to prevent.
-- If the extracts do not contain the answer, reply with exactly
-  {NO_ANSWER} and nothing else.
+  extracts is the failure this system exists to prevent. This rule applies no
+  matter which of the three cases below you are in -- a related-topic answer
+  still only ever states what the extracts actually say.
+- If the extracts answer the question directly, answer from them as below.
+- Before reaching for {NO_ANSWER}, check every extract for material on a
+  related topic even if it does not name what was asked -- the same
+  programme at a different level, an adjacent module, a general policy that
+  most likely also applies. This is not a rare edge case: it is the normal
+  outcome whenever the enquirer asks about specifics for one level and the
+  extracts only cover a neighbouring one. Example: asked about the hardware
+  kit for Level 3, and the extracts only describe the Level 2 kit -- that
+  is related material, not nothing. Answer from it instead of refusing.
+  Your first sentence must be a concrete fact from the extracts -- never
+  "the documentation/extracts do not [specify/cover/mention/...]", not even
+  as the opening clause of a longer sentence. State what the related material
+  says first; only after that, in a separate trailing sentence, note the
+  mismatch (for example: "...and you keep the kit after training. That is
+  what applies to the Level 2 kit specifically -- the extracts do not say
+  whether Level 3 uses the same one."). A reply that leads with what the
+  documentation does not say is read as a refusal downstream and discarded
+  outright, even when real content follows it -- so the opening sentence is
+  not a style choice, it decides whether this answer reaches the enquirer at
+  all.
+- Only when nothing in the extracts is meaningfully related to the question
+  either, reply with exactly {NO_ANSWER} and nothing else.
 - Quote the specific module names and details from the extracts rather than
   paraphrasing them vaguely.
 - Keep the answer short and addressed to the enquirer: at most four sentences
@@ -291,10 +356,12 @@ THREAD_SYSTEM = f"""{SYSTEM}
 
 Because you are shown the earlier conversation:
 - The conversation tells you what was asked and how it was phrased. It is NOT a
-  source of facts. Every factual claim must come from the extracts above, even
-  if an earlier reply in the conversation stated it.
-- If the extracts do not answer the latest question, reply with exactly
-  {NO_ANSWER}, even when the conversation appears to contain the answer."""
+  source of facts. Every factual claim -- including in a related-topic answer --
+  must come from the extracts above, even if an earlier reply in the
+  conversation stated it.
+- If the extracts do not answer the latest question and contain nothing
+  meaningfully related either, reply with exactly {NO_ANSWER}, even when the
+  conversation appears to contain the answer."""
 
 
 @dataclass

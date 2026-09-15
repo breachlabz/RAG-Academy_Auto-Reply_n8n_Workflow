@@ -1,0 +1,203 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa;
+  --line: #e6e5e2;
+  --line-soft: #eeeeec;
+  --text: #202124;
+  --muted: #86867e;
+  --muted-2: #a8a89f;
+  --accent: #1a1a1a;
+  --accent-text: #ffffff;
+  --danger: #a02f27;
+  --ok: #1e6b2e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17171a;
+    --line: #2a2a2d;
+    --line-soft: #232326;
+    --text: #e9e9e6;
+    --muted: #85857f;
+    --muted-2: #63635e;
+    --accent: #eeeeec;
+    --accent-text: #17171a;
+    --danger: #e58179;
+    --ok: #82c78e;
+  }
+}
+* { box-sizing: border-box; }
+html, body { padding: 0; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+body { padding: 28px 20px 60px; }
+
+.wrap { max-width: 1320px; margin: 0 auto; }
+.dry-run-banner {
+  display: inline-block;
+  background: #fff6da;
+  color: #6b5300;
+  border: 1px solid #e8d68a;
+  border-radius: 999px;
+  padding: 3px 11px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-bottom: 16px;
+}
+@media (prefers-color-scheme: dark) {
+  .dry-run-banner { background: #3a3010; color: #f0d878; border-color: #5c4a17; }
+}
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 22px; flex-wrap: wrap; }
+h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+.count { color: var(--muted); font-size: 12px; }
+.toolbar { display: flex; gap: 10px; align-items: center; }
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text);
+  border-radius: 5px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+button:hover { border-color: var(--muted-2); }
+button.primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+/* .busy (not the native `disabled` attribute) blocks re-clicks on the Send
+   button. Disabling the element that just received focus from the click
+   makes the browser drop focus to <body>, and Chrome resets scroll to the
+   top of the page when that happens -- this bit us once already. */
+button.busy { opacity: .45; cursor: default; pointer-events: none; }
+button.link {
+  border: none;
+  padding: 0;
+  color: var(--muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-size: 11.5px;
+}
+button.link:hover { color: var(--text); }
+
+#loadError { color: var(--danger); padding: 30px 2px; font-size: 12.5px; }
+#empty { color: var(--muted); padding: 30px 2px; font-size: 12.5px; }
+
+.board { display: flex; flex-direction: column; }
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1.5fr 1.5fr 1.7fr;
+  gap: 22px;
+  padding: 18px 0;
+  border-top: 1px solid var(--line);
+}
+.row.sent { opacity: .38; }
+.col { min-width: 0; }
+.label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted-2);
+  margin-bottom: 7px;
+}
+
+.meta-row { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; font-size: 12px; }
+.meta-k { color: var(--muted); flex-shrink: 0; }
+.meta-v { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.clamp-text {
+  white-space: pre-wrap;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.clamp-text.clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.expand-toggle { margin-top: 6px; }
+.gist {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line-soft);
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+  line-height: 1.45;
+}
+.gist-label {
+  font-style: normal;
+  font-weight: 600;
+  color: var(--muted-2);
+}
+
+/* Grid cells stretch to the row's full height by default, so a flex column
+   here plus margin-top:auto on the actions pins Reset/Send to the bottom
+   right of the row regardless of how tall the other columns are. */
+.edit-cell { display: flex; flex-direction: column; }
+.edit-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: auto; padding-top: 10px; }
+textarea {
+  width: 100%;
+  min-height: 6.5em;
+  resize: vertical;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+}
+textarea:focus { outline: none; border-color: var(--muted-2); }
+.status { font-size: 11.5px; margin-top: 7px; }
+.status.error { color: var(--danger); }
+.status.ok { color: var(--ok); }
+
+/* Sections get real breathing room between them -- this is a visual break
+   between two different tasks (approve-and-send vs. a read-only record),
+   not just the next item in one list. */
+section + section { margin-top: 64px; }
+.section-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+  margin: 0 0 4px;
+}
+
+/* One header row per section instead of repeating the four labels on every
+   row -- same grid as .row so its columns line up, but no top border (it's
+   the top of the list, not another item in it) and no bottom padding. */
+.header-row {
+  border-top: none;
+  padding: 0 0 8px;
+}
+.header-row .label { margin-bottom: 0; }
+
+.edited-note {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted-2);
+  margin-bottom: 6px;
+}
+
+@media (max-width: 860px) {
+  .row { grid-template-columns: 1fr; gap: 10px; }
+  .header-row { display: none; } /* the 4 stacked columns don't need a legend at this width */
+  .edit-actions { margin-top: 10px; }
+}
