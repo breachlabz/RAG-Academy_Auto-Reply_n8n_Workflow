@@ -62,6 +62,8 @@ from classifier import DEFAULT_THRESHOLD, classify, route
 from mail import graph as mail_graph
 from mail import to_plain_text
 from rag import answer as rag_answer
+from rag import answer_followup
+from rag import is_near_duplicate
 from rag import resolve_format
 from rag.core import EMAIL_SUBJECT, format_email, ground
 from rag.format_hint import as_bullets, wants_list
@@ -146,6 +148,7 @@ class ReplyRequest(BaseModel):
     subject: str = ""
     message_id: str | None = None
     threshold: float | None = None
+    from_email: str = ""
     # Reply shape: "auto" (default) decides from the email -- a bulleted list
     # when the enquirer wrote one, asked "in points", or asked several things;
     # prose otherwise. "list" / "prose" force it.
@@ -172,6 +175,7 @@ class PrepareRequest(BaseModel):
     message_id: str | None = None
     ref: str = ""
     threshold: float | None = None
+    from_email: str = ""
 
 
 class FinalizeRequest(BaseModel):
@@ -185,12 +189,16 @@ class FinalizeRequest(BaseModel):
     `format` is `/emails/prepare`'s `format` echoed back: "list" runs the
     grounded body through `as_bullets` as a net for when the agent answered a
     list-shaped enquiry in one paragraph anyway; anything else leaves it alone.
+
+    `exchange_id` is also `/emails/prepare`'s, echoed straight through to the
+    response so Record reply can pass it to /threads/reply unchanged.
     """
 
     output: str
     subject: str = ""
     conversation_id: str | None = None
     format: str = "prose"
+    exchange_id: int | None = None
 
 
 class RecordReplyRequest(BaseModel):
@@ -203,6 +211,12 @@ class RecordReplyRequest(BaseModel):
     # n8n's `$execution.resumeUrl` for the Wait node paused right after this
     # call, when the caller is the Academy Agent workflow. See review_send().
     resume_url: str | None = None
+    # Threaded all the way from /emails/prepare's record_inbound, through
+    # Finalize, so this lands on the exact row it was drafted for instead of
+    # thread_store.record_reply's "most recent unanswered" fallback guess.
+    # None from any caller that predates this (e.g. a hand-built request) --
+    # record_reply falls back to the guess in that case only.
+    exchange_id: int | None = None
 
 
 @app.get("/health")
@@ -344,11 +358,22 @@ def generate_reply(req: ReplyRequest) -> dict:
     # sitting in its own context.
     block, prior = thread_context.load(key)
 
+    # See /emails/prepare's identical check for why this runs before the new
+    # email is recorded and why it is an embedding comparison, not a text one.
+    pending = next(
+        (e for e in reversed(prior) if not e.answered and not e.is_followup), None
+    )
+
     fresh = thread_store.record_inbound(
         key,
         email_text,
         subject=req.subject,
         message_id=req.message_id,
+        sender_email=req.from_email,
+    )
+
+    near_duplicate = bool(
+        fresh and pending and is_near_duplicate(email_text, pending.query)
     )
 
     # Classified against `block`, the thread up to but not including this email.
@@ -360,6 +385,7 @@ def generate_reply(req: ReplyRequest) -> dict:
         "conversation_id": key,
         "thread_length": len(prior),
         "duplicate": not fresh,
+        "near_duplicate": near_duplicate,
         "answered": False,
         "answer": "",
         "subject": "",
@@ -370,6 +396,15 @@ def generate_reply(req: ReplyRequest) -> dict:
 
     if not fresh:
         payload["reason"] = "already handled (duplicate message_id)"
+        return payload
+
+    if near_duplicate:
+        # Same reasoning as the duplicate-message_id branch above: the first
+        # ask is still sitting unanswered on this thread, so a second draft
+        # would be redundant work at best and two replies to one question at
+        # worst. No draft, no error -- the existing pending turn still covers
+        # this.
+        payload["reason"] = "near-duplicate of a still-unanswered question in this thread"
         return payload
 
     if payload["route"] != "rag":
@@ -440,7 +475,10 @@ def prepare_email(req: PrepareRequest) -> dict:
     on), `history` / `email_text` / `query` / `format` (the agent's prompt),
     and `subject` / `conversation_id` / `ref` (carried through to finalize and
     the thread record; `ref` ends up on the stored exchange row for the
-    review queue's Graph reply call later).
+    review queue's Graph reply call later). `exchange_id` is the row
+    `record_inbound` just opened -- Finalize and Record reply must carry it
+    through unchanged so the eventual reply lands on this exact row instead
+    of record_reply's "most recent unanswered" fallback guess.
 
     `format` is `"list"` or `"prose"`, decided from the enquirer's own wording
     the same way `/answer` decides it (`rag.format_hint.wants_list`). The agent
@@ -454,8 +492,34 @@ def prepare_email(req: PrepareRequest) -> dict:
     # but not including it -- same ordering, and same reason, as /generate-reply.
     block, prior = thread_context.load(key)
 
-    fresh = thread_store.record_inbound(
-        key, email_text, subject=req.subject, message_id=req.message_id, ref=req.ref
+    # The still-open question on this thread, if there is one -- checked
+    # against the new email below, before it is recorded, so this can never
+    # find itself. A follow-up placeholder is not a real question to compare
+    # against (see threads.context.render for why is_followup rows are not
+    # ordinary turns).
+    pending = next(
+        (e for e in reversed(prior) if not e.answered and not e.is_followup), None
+    )
+
+    exchange_id = thread_store.record_inbound(
+        key,
+        email_text,
+        subject=req.subject,
+        message_id=req.message_id,
+        ref=req.ref,
+        sender_email=req.from_email,
+    )
+    fresh = exchange_id is not None
+
+    # A second email that is really the same question again -- an impatient
+    # re-ask, a reworded repeat -- while the first is still sitting
+    # unanswered on this thread. Checked against meaning, not text, because
+    # "when does L2 start?" and "what's the L2 start date?" share no useful
+    # substring. A genuinely new question on the same thread has to pass
+    # through untouched, which is why this is a real embedding comparison
+    # (rag.is_near_duplicate) rather than a keyword or length heuristic.
+    near_duplicate = bool(
+        fresh and pending and is_near_duplicate(email_text, pending.query)
     )
 
     # Classified against `block` -- the thread before this email -- so a
@@ -468,11 +532,13 @@ def prepare_email(req: PrepareRequest) -> dict:
     # embeds it; a first email is passed through unchanged. Only worth the extra
     # model call when the email is actually going to reach the agent.
     query = email_text
-    if fresh and gate:
+    if fresh and gate and not near_duplicate:
         query = thread_context.standalone_question(email_text, prior)
 
     if not fresh:
         reason = "already handled (duplicate message_id)"
+    elif near_duplicate:
+        reason = "near-duplicate of a still-unanswered question in this thread"
     elif "error" in payload:
         reason = "unclassified"
     elif not gate:
@@ -481,8 +547,9 @@ def prepare_email(req: PrepareRequest) -> dict:
         reason = "ok"
 
     payload |= {
-        "proceed": fresh and gate,
+        "proceed": fresh and gate and not near_duplicate,
         "conversation_id": key,
+        "exchange_id": exchange_id,
         "subject": req.subject,
         "email_text": email_text,
         "query": query,
@@ -491,6 +558,7 @@ def prepare_email(req: PrepareRequest) -> dict:
         "format": "list" if wants_list(email_text) else "prose",
         "thread_length": len(prior),
         "duplicate": not fresh,
+        "near_duplicate": near_duplicate,
         "reason": reason,
     }
     return payload
@@ -527,6 +595,7 @@ def finalize_email(req: FinalizeRequest) -> dict:
     return {
         "grounded": grounded,
         "conversation_id": key,
+        "exchange_id": req.exchange_id,
         "subject": EMAIL_SUBJECT if grounded else "",
         "answer": body,
         "reply": format_email(body, answered=True) if grounded else "",
@@ -537,12 +606,14 @@ def finalize_email(req: FinalizeRequest) -> dict:
 
 @app.post("/threads/reply")
 def record_thread_reply(req: RecordReplyRequest) -> dict:
-    """Record an outbound reply against the most recent unanswered turn.
+    """Record an outbound reply against the turn it was drafted for.
 
     The split Outlook path needs this as its own call: `/emails/finalize` shapes
     the draft but does not store it, because the workflow records only once the
     draft is actually in the mailbox. Pairs with the `record_inbound` that
-    `/emails/prepare` did earlier for the same conversation.
+    `/emails/prepare` did earlier for the same conversation -- `exchange_id`
+    is that same call's row id, carried through Finalize unchanged, so this
+    always targets the exact row rather than guessing.
     """
     key = thread_store.thread_key(req.conversation_id, req.subject)
     thread_store.record_reply(
@@ -551,6 +622,7 @@ def record_thread_reply(req: RecordReplyRequest) -> dict:
         subject=req.subject,
         grounded=req.grounded,
         resume_url=req.resume_url,
+        exchange_id=req.exchange_id,
     )
     return {"ok": True, "conversation_id": key}
 
@@ -577,10 +649,72 @@ def get_thread(conversation_id: str) -> dict:
                 "grounded": e.grounded,
                 "created_at": e.created_at,
                 "replied_at": e.replied_at,
+                "is_followup": e.is_followup,
+                "sent": e.sent,
             }
             for e in exchanges
         ],
     }
+
+
+class CreateFollowupRequest(BaseModel):
+    """`POST /threads/{conversation_id}/followup` -- schedule one follow-up
+    stage: a message the system owes the enquirer that is not a reply to
+    anything they wrote and does not expect them to write back. Independent
+    of any other stage already scheduled on this thread -- to queue a
+    second stage, call this again with its own `due_at`; there is no chain
+    to configure and no dependency between stages.
+    """
+
+    topic: str
+    due_at: str
+    subject: str = ""
+
+
+@app.post("/threads/{conversation_id:path}/followup")
+def schedule_followup(conversation_id: str, req: CreateFollowupRequest) -> dict:
+    exchange_id = thread_store.create_followup(
+        conversation_id, req.topic, req.due_at, subject=req.subject
+    )
+    return {"ok": True, "id": exchange_id, "conversation_id": conversation_id}
+
+
+@app.post("/followups/process")
+def process_followups() -> dict:
+    """Draft every scheduled follow-up whose due_at has passed.
+
+    Meant to be called on a schedule -- an n8n Cron workflow, a host cron
+    job, whatever fires it -- not from anywhere in the enquiry/reply path.
+    Idempotent to call repeatedly or concurrently: `due_followups()` only
+    ever returns rows still at `reply IS NULL`, and `draft_followup` fills
+    exactly the row it was given, so a follow-up already drafted by an
+    overlapping run simply will not be picked up again.
+
+    A grounded follow-up is recorded exactly like any other reply and lands
+    in /review -- nothing here ever sends anything. One that could not be
+    grounded (the topic has nothing to say from the documents) is left
+    undrafted rather than recorded empty or invented; it stays due for the
+    next run, same as a topic that genuinely has no answer never gets one
+    conjured for it elsewhere in this system.
+    """
+    processed = []
+    for row in thread_store.due_followups():
+        result = answer_followup(row["query"])
+        if result.grounded:
+            thread_store.draft_followup(row["id"], result.reply, grounded=True)
+            processed.append(
+                {"id": row["id"], "conversation_id": row["conversation_id"], "drafted": True}
+            )
+        else:
+            processed.append(
+                {
+                    "id": row["id"],
+                    "conversation_id": row["conversation_id"],
+                    "drafted": False,
+                    "reason": result.error or "no grounded content for this topic",
+                }
+            )
+    return {"processed": processed}
 
 
 # --- Review queue -------------------------------------------------------
@@ -605,12 +739,63 @@ def review_page() -> FileResponse:
     return FileResponse(_REVIEW_DIST / "index.html")
 
 
+def _group_by_conversation(rows: list[dict]) -> list[dict]:
+    """Fold a flat list of exchange rows into one entry per conversation, in
+    first-seen order.
+
+    `pending_review()`/`sent_history()` return one row per enquiry/reply
+    turn -- correct for storage (each turn has its own `sent` flag and its
+    own n8n `resume_url`, which genuinely have to stay per-turn), but wrong
+    for a reviewer to look at: two pending turns from the same thread used to
+    show up as two disconnected rows with nothing tying them together.
+    `conversation_subject` moves up onto the group -- every row in one group
+    carries the same value, so repeating it per turn was only noise.
+
+    `other_open_threads` and `other_sent_threads` are the Case-1b signals:
+    other conversations from the same sender address that still have
+    something open, and other conversations already sent to them,
+    respectively. Both computed for every group regardless of which section
+    it ends up in -- a pending card benefits from "already sent 3 replies
+    to this person" as context just as much as a History card benefits from
+    "they also have something open elsewhere". Deliberately just a count +
+    list for a human to read, never something this groups together or acts
+    on -- see thread_store.sender_threads/sender_sent_threads for why.
+    """
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    for row in rows:
+        conv_id = row["conversation_id"]
+        if conv_id not in groups:
+            sender_email = row.get("conversation_sender_email", "") or ""
+            groups[conv_id] = {
+                "conversation_id": conv_id,
+                "conversation_subject": row.get("conversation_subject", ""),
+                "sender_email": sender_email,
+                "other_open_threads": thread_store.sender_threads(
+                    sender_email, exclude_conversation_id=conv_id
+                ),
+                "other_sent_threads": thread_store.sender_sent_threads(
+                    sender_email, exclude_conversation_id=conv_id
+                ),
+                "exchanges": [],
+            }
+            order.append(conv_id)
+        groups[conv_id]["exchanges"].append(
+            {
+                k: v
+                for k, v in row.items()
+                if k not in ("conversation_subject", "conversation_sender_email")
+            }
+        )
+    return [groups[conv_id] for conv_id in order]
+
+
 @app.get("/review/queue")
 def review_queue() -> dict:
-    """Grounded replies waiting for a human. Query gists are generated (and
-    cached) here, lazily, rather than at draft time -- every email would
-    otherwise pay for a summary even when the classifier gate or the
-    grounding net was always going to keep it out of this queue."""
+    """Grounded replies waiting for a human, grouped by conversation. Query
+    gists are generated (and cached) here, lazily, rather than at draft time
+    -- every email would otherwise pay for a summary even when the classifier
+    gate or the grounding net was always going to keep it out of this queue."""
     pending = thread_store.pending_review()
     for row in pending:
         if not row.get("query_gist"):
@@ -618,13 +803,14 @@ def review_queue() -> dict:
             thread_store.set_query_gist(row["id"], row["query_gist"])
     # Surfaced so the page can show a persistent "not really sending" banner
     # the whole time REVIEW_DRY_RUN is on, not just after someone clicks Send.
-    return {"pending": pending, "dry_run": REVIEW_DRY_RUN}
+    return {"pending": _group_by_conversation(pending), "dry_run": REVIEW_DRY_RUN}
 
 
 @app.get("/review/history")
 def review_history() -> dict:
-    """Already-sent replies, most recent first -- the page's History section."""
-    return {"history": thread_store.sent_history()}
+    """Already-sent replies, grouped by conversation, most recently sent
+    thread first -- the page's History section."""
+    return {"history": _group_by_conversation(thread_store.sent_history())}
 
 
 # UI-only testing escape hatch: skip the real Graph call so the queue/edit/

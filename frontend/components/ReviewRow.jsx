@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import ClampedText from "./ClampedText";
 import { sendReply } from "../lib/api";
+import { applyCase, wrapSelection } from "../lib/textFormat";
 
 function fmtDate(iso) {
   if (!iso) return "—";
@@ -28,8 +29,24 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState(null); // { kind: "ok" | "error", message }
   const [sent, setSent] = useState(false);
+  const textareaRef = useRef(null);
 
-  const subject = row.conversation_subject || row.query_subject || "(no subject)";
+  // Runs a transform (applyCase/wrapSelection from lib/textFormat) against
+  // the textarea's current native selection, applies the result, then
+  // restores focus and selection on the next tick -- setText re-renders
+  // the textarea first, so the DOM selection has to be reapplied after,
+  // not in the same handler tick.
+  function runFormat(transform) {
+    const el = textareaRef.current;
+    if (!el) return;
+    const { selectionStart, selectionEnd } = el;
+    const result = transform(text, selectionStart, selectionEnd);
+    setText(result.text);
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(result.selectionStart, result.selectionEnd);
+    });
+  }
 
   async function handleSend() {
     if (busy) return;
@@ -54,15 +71,11 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
     <div className={"row" + (sent ? " sent" : "")}>
       <div className="col meta">
         <div className="meta-row">
-          <span className="meta-k">Subject</span>
-          <span className="meta-v" title={subject}>{subject}</span>
+          <span className="meta-k">ID</span>
+          <span className="meta-v">{row.id}</span>
         </div>
         <div className="meta-row">
-          <span className="meta-k">Conversation</span>
-          <span className="meta-v" title={row.conversation_id || ""}>{row.conversation_id || ""}</span>
-        </div>
-        <div className="meta-row">
-          <span className="meta-k">Received</span>
+          <span className="meta-k">{row.is_followup ? "Scheduled" : "Received"}</span>
           <span className="meta-v">{fmtDate(row.created_at)}</span>
         </div>
         <div className="meta-row">
@@ -72,6 +85,7 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
       </div>
 
       <div className="col">
+        {row.is_followup && <div className="followup-badge">Follow-up · no reply expected</div>}
         <ClampedText text={row.query || ""} />
         {row.query_gist && (
           <div className="gist"><span className="gist-label">Summary:</span> {row.query_gist}</div>
@@ -83,7 +97,26 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
       </div>
 
       <div className="col edit-cell">
+        <div className="format-toolbar">
+          <button type="button" title="Capitalize each word" onClick={() => runFormat((t, s, e) => applyCase(t, s, e, "title"))}>
+            Aa
+          </button>
+          <button type="button" title="UPPERCASE" onClick={() => runFormat((t, s, e) => applyCase(t, s, e, "upper"))}>
+            AA
+          </button>
+          <button type="button" title="lowercase" onClick={() => runFormat((t, s, e) => applyCase(t, s, e, "lower"))}>
+            aa
+          </button>
+          <span className="format-toolbar-sep" />
+          <button type="button" title="Bold (**text**)" className="format-bold" onClick={() => runFormat((t, s, e) => wrapSelection(t, s, e, "**"))}>
+            B
+          </button>
+          <button type="button" title="Italic (*text*)" className="format-italic" onClick={() => runFormat((t, s, e) => wrapSelection(t, s, e, "*"))}>
+            I
+          </button>
+        </div>
         <textarea
+          ref={textareaRef}
           className="edit-box"
           value={text}
           onChange={(e) => setText(e.target.value)}

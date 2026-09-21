@@ -21,22 +21,17 @@ function fmtDate(iso) {
 // differs from `reply` (the original AI draft) when a human changed it
 // before clicking Send.
 export default function HistoryRow({ row }) {
-  const subject = row.conversation_subject || row.query_subject || "(no subject)";
   const wasEdited = (row.edited_reply || "") !== (row.reply || "");
 
   return (
     <div className="row history-row">
       <div className="col meta">
         <div className="meta-row">
-          <span className="meta-k">Subject</span>
-          <span className="meta-v" title={subject}>{subject}</span>
+          <span className="meta-k">ID</span>
+          <span className="meta-v">{row.id}</span>
         </div>
         <div className="meta-row">
-          <span className="meta-k">Conversation</span>
-          <span className="meta-v" title={row.conversation_id || ""}>{row.conversation_id || ""}</span>
-        </div>
-        <div className="meta-row">
-          <span className="meta-k">Received</span>
+          <span className="meta-k">{row.is_followup ? "Scheduled" : "Received"}</span>
           <span className="meta-v">{fmtDate(row.created_at)}</span>
         </div>
         <div className="meta-row">
@@ -46,6 +41,7 @@ export default function HistoryRow({ row }) {
       </div>
 
       <div className="col">
+        {row.is_followup && <div className="followup-badge">Follow-up · no reply expected</div>}
         <ClampedText text={row.query || ""} />
         {row.query_gist && (
           <div className="gist"><span className="gist-label">Summary:</span> {row.query_gist}</div>

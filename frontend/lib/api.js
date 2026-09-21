@@ -5,11 +5,17 @@
 // the literal "/review" prefix here has to stay hardcoded to match api.py.
 const BASE = "/review";
 
+// Both endpoints now return one entry per conversation --
+// { conversation_id, conversation_subject, exchanges: [...] } -- instead of
+// a flat list of turns, so a thread with several pending or sent replies
+// renders as one card instead of several disconnected rows. See
+// api.py's _group_by_conversation.
+
 export async function fetchQueue() {
   const res = await fetch(`${BASE}/queue`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return { pending: data.pending || [], dryRun: !!data.dry_run };
+  return { groups: data.pending || [], dryRun: !!data.dry_run };
 }
 
 export async function fetchHistory() {

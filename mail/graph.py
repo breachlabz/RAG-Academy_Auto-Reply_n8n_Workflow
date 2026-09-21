@@ -20,7 +20,9 @@ do anything else Mail.Send doesn't require.
 
 from __future__ import annotations
 
+import html
 import os
+import re
 import time
 
 import requests
@@ -82,8 +84,37 @@ def _access_token(*, timeout: int = 20) -> str:
     return _fetch_token(timeout=timeout)
 
 
+# The review edit box's Bold/Italic buttons wrap the selection in **/*. The
+# lookarounds keep stray asterisks ("5 * 3", "a*b*c", a lone "*") as literal
+# text: a marker only counts when it hugs non-space text on the inside and is
+# not glued to a word character on the outside (italic) -- and nothing here
+# crosses a line break.
+_BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+_ITALIC_RE = re.compile(r"(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])")
+
+
+def reply_html(text: str) -> str | None:
+    """Render the reviewer's **bold** / *italic* markers as an HTML body.
+
+    Returns None when the text has no formatting, so the caller can keep
+    sending the plain `comment` (which Graph places above the quoted
+    original thread) for the ordinary case.
+    """
+    escaped = html.escape(text, quote=False)
+    formatted = _ITALIC_RE.sub(r"<em>\1</em>", _BOLD_RE.sub(r"<strong>\1</strong>", escaped))
+    if formatted == escaped:
+        return None
+    paragraphs = [p.replace("\n", "<br>") for p in re.split(r"\n\s*\n", formatted.strip())]
+    return "".join(f"<p>{p}</p>" for p in paragraphs)
+
+
 def send_reply(message_ref: str, comment: str, *, timeout: int = 30) -> None:
     """Send `comment` as a reply to `message_ref` (a Graph message id) now.
+
+    Plain text goes as Graph's `comment`. If it carries **bold** / *italic*
+    markers it goes as an HTML `message.body` instead (Graph rejects sending
+    both) -- with the trade-off that a supplied body replaces the whole
+    reply body, so the quoted earlier thread is not appended in that case.
 
     Raises GraphNotConfigured if the app registration is not set up yet, and
     GraphSendError on anything Graph itself rejects -- this never returns a
@@ -99,11 +130,18 @@ def send_reply(message_ref: str, comment: str, *, timeout: int = 30) -> None:
     if not message_ref:
         raise GraphSendError("no Graph message id (ref) stored for this exchange")
 
+    body_html = reply_html(comment)
+    payload = (
+        {"message": {"body": {"contentType": "HTML", "content": body_html}}}
+        if body_html is not None
+        else {"comment": comment}
+    )
+
     try:
         token = _access_token(timeout=timeout)
         resp = requests.post(
             f"{_GRAPH_BASE}/users/{MAILBOX}/messages/{message_ref}/reply",
-            json={"comment": comment},
+            json=payload,
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
         )

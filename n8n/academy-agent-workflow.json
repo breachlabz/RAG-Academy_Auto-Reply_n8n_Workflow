@@ -36,7 +36,7 @@
         -288,
         304
       ],
-      "notes": "Needs a Microsoft Outlook OAuth2 credential (Mail.Read -- read-only, this only polls the inbox now). Poll, not webhook: a Graph subscription needs a publicly reachable URL and this n8n is bound to loopback."
+      "notes": "Needs a Microsoft Outlook OAuth2 credential (Mail.ReadWrite). Poll, not webhook: a Graph subscription needs a publicly reachable URL and this n8n is bound to loopback."
     },
     {
       "parameters": {},
@@ -53,7 +53,7 @@
     {
       "parameters": {
         "mode": "raw",
-        "jsonOutput": "={\n  \"id\": \"TEST-MESSAGE-ID-{{ $now.toMillis() }}\",\n  \"conversationId\": \"TEST-CONVERSATION-{{ $now.toMillis() }}\",\n  \"internetMessageId\": \"<test-{{ $now.toMillis() }}@example.com>\",\n  \"subject\": \"EVH Level 3 hardware kit / BOM\",\n  \"bodyPreview\": \"What hardware kit and BOM do I need for the EVH Level 3 course?\",\n  \"body\": {\n    \"contentType\": \"html\",\n    \"content\": \"<html><body><p>Hi,</p><p>Could you tell me what <strong>hardware kit and BOM</strong> I need for the <strong>EVH Level 3</strong> course? I already have the Level 2 kit from my earlier training.</p><p>Thanks,<br />Test User</p></body></html>\"\n  },\n  \"from\": {\n    \"emailAddress\": {\n      \"address\": \"client35@example.com\",\n      \"name\": \"Test User\"\n    }\n  },\n  \"receivedDateTime\": \"2026-09-03T09:30:00Z\"\n}\n",
+        "jsonOutput": "={\n  \"id\": \"TEST-MESSAGE-ID-{{ $now.toMillis() }}\",\n  \"conversationId\": \"TEST-CONVERSATION-{{ $now.toMillis() }}\",\n  \"internetMessageId\": \"<test-{{ $now.toMillis() }}@example.com>\",\n  \"subject\": \"EVH Level 3 certificate and exam format\",\n  \"bodyPreview\": \"Could you tell me about the exam format and certification process for Level 3?\",\n  \"body\": {\n    \"contentType\": \"html\",\n    \"content\": \"<html><body><p>Hi,</p><p>I've just finished EVH Level 2 and I'm looking at Level 3 next. Could you tell me about the exam format and certification process for Level 3? I already know Level 2 uses a CTF-style assessment, so I'm wondering if Level 3 works the same way.</p><p>Thanks,<br />Test User</p></body></html>\"\n  },\n  \"from\": {\n    \"emailAddress\": {\n      \"address\": \"client35@example.com\",\n      \"name\": \"Test User\"\n    }\n  },\n  \"receivedDateTime\": \"2026-09-17T09:30:00Z\"\n}\n",
         "options": {}
       },
       "id": "test-email",
@@ -119,7 +119,7 @@
         "promptType": "define",
         "text": "={{ $('Prepare').item.json.history ? 'Conversation so far (for context and phrasing only -- it is not a source of facts):\\n\\n' + $('Prepare').item.json.history + '\\n\\n---\\n\\n' : '' }}Latest email\\nSubject: {{ $('Prepare').item.json.subject }}\\n\\n{{ $('Prepare').item.json.email_text }}{{ $('Prepare').item.json.query && $('Prepare').item.json.query !== $('Prepare').item.json.email_text ? '\\n\\n(Read as a standalone question, the latest email asks: ' + $('Prepare').item.json.query + ')' : '' }}{{ $('Prepare').item.json.format === 'list' ? '\\n\\nFormat: reply as a bulleted list -- one \"- \" item per point, at most six points, no heading or preamble before the first item.' : '\\n\\nFormat: reply in plain prose, at most four sentences, with no list.' }}",
         "options": {
-          "systemMessage": "You draft replies to enquiries about the training programmes described in the Academy documentation.\n\nBefore you answer you MUST search academy_docs. If the first search comes back thin, search again with the enquirer's own wording, and again with the level or module name if they named one.\n\nRules:\n- Use only what academy_docs returns. Never use outside knowledge, and never guess a date, a price, a duration or a prerequisite that is not written there. This applies especially to subjects you know about independently -- answering an automotive security question from your own knowledge rather than from the retrieved documentation is the failure this system exists to prevent. This rule applies no matter which of the three cases below you are in -- a related-topic answer still only ever states what academy_docs actually returned.\n- If academy_docs answers the question directly, answer from it as below.\n- Before reaching for NOT_IN_DOCUMENTS, check what academy_docs returned for material on a related topic even if it does not name what was asked -- the same programme at a different level, an adjacent module, a general policy that most likely also applies. This is not a rare edge case: it is the normal outcome whenever the enquirer asks about specifics for one level and the documentation only covers a neighbouring one. Example: asked about the hardware kit for Level 3, and the documentation only describes the Level 2 kit -- that is related material, not nothing. Answer from it instead of refusing. Your first sentence must be a concrete fact from the documentation -- never \"the documentation/extracts do not [specify/cover/mention/...]\", not even as the opening clause of a longer sentence. State what the related material says first; only after that, in a separate trailing sentence, note the mismatch (for example: \"...and you keep the kit after training. That is what applies to the Level 2 kit specifically -- the documentation does not say whether Level 3 uses the same one.\"). A reply that leads with what the documentation does not say is read as a refusal downstream and discarded outright, even when real content follows it -- so the opening sentence is not a style choice, it decides whether this answer reaches the enquirer at all.\n- Only when nothing academy_docs returned is meaningfully related to the question either, reply with exactly NOT_IN_DOCUMENTS and nothing else. Do not explain, do not apologise, and do not write a sentence saying the documentation does not specify it -- that sentence is a refusal wearing an answer's clothes, and it defeats the check downstream. The bare token.\n- Quote the specific level and module names from the documentation rather than paraphrasing them vaguely.\n- Match the shape of your answer to the request. When the enquirer wrote their questions as a numbered or bulleted list, asked for a list or \"in points\", or asked several separate things, reply as a bulleted list -- one \"- \" item per point, at most six points, no heading or preamble before the first item. Otherwise answer in plain prose, at most four sentences. The \"Format:\" line at the end of the message says which the latest email calls for -- follow it.\n- Address the enquirer directly.\n- Do not mention documents, extracts, context, or the search tool in your answer.\n- Write the body only. No greeting and no sign-off -- those are added after you.\n\nYou are shown the earlier messages of this conversation. They tell you what was asked and how it was phrased. They are NOT a source of facts: every factual claim -- including in a related-topic answer -- must come from academy_docs, even if an earlier reply in this conversation stated it. If academy_docs does not answer the latest question and contains nothing meaningfully related either, reply with exactly NOT_IN_DOCUMENTS even when the conversation appears to contain the answer.",
+          "systemMessage": "You draft replies to enquiries about the training programmes described in the Academy documentation.\n\nBefore you answer you MUST search academy_docs. If the first search comes back thin, search again with the enquirer's own wording, and again with the level or module name if they named one.\n\nCRITICAL: finding results about a different level, module or topic than the one asked about is NOT the same as finding nothing. Do not treat a near-miss as a reason to refuse. Read every result academy_docs returns before deciding NOT_IN_DOCUMENTS -- if any of them concern the same programme family (the same training track, a neighbouring level, an adjacent module, a policy that likely also applies), that is usable material, not an empty search.\n\nRules:\n- Use only what academy_docs returns. Never use outside knowledge, and never guess a date, a price, a duration or a prerequisite that is not written there. This applies especially to subjects you know about independently -- answering an automotive security question from your own knowledge rather than from the retrieved documentation is the failure this system exists to prevent. This rule applies no matter which of the three cases below you are in -- a related-topic answer still only ever states what academy_docs actually returned.\n- If academy_docs answers the question directly, answer from it as below.\n- If it does not cover the specific question but returned material on a related topic (see CRITICAL above), answer from that material instead of refusing. Your first sentence must be a concrete fact from the documentation -- never \"the documentation/extracts do not [specify/cover/mention/...]\", not even as the opening clause of a longer sentence. State what the related material says first; only after that, in a separate trailing sentence, note the mismatch (for example: \"...and you keep the kit after training. That is what applies to the Level 2 kit specifically -- the documentation does not say whether Level 3 uses the same one.\"). A reply that leads with what the documentation does not say is read as a refusal downstream and discarded outright, even when real content follows it -- so the opening sentence is not a style choice, it decides whether this answer reaches the enquirer at all.\n- Only when academy_docs returned nothing meaningfully related to the question either -- not even a different level or module of the same programme -- reply with exactly NOT_IN_DOCUMENTS and nothing else. Do not explain, do not apologise, and do not write a sentence saying the documentation does not specify it -- that sentence is a refusal wearing an answer's clothes, and it defeats the check downstream. The bare token.\n- Quote the specific level and module names from the documentation rather than paraphrasing them vaguely.\n- Match the shape of your answer to the request. When the enquirer wrote their questions as a numbered or bulleted list, asked for a list or \"in points\", or asked several separate things, reply as a bulleted list -- one \"- \" item per point, at most six points, no heading or preamble before the first item. Otherwise answer in plain prose, at most four sentences. The \"Format:\" line at the end of the message says which the latest email calls for -- follow it.\n- Address the enquirer directly.\n- Do not mention documents, extracts, context, or the search tool in your answer.\n- Write the body only. No greeting and no sign-off -- those are added after you.\n\nYou are shown the earlier messages of this conversation. They tell you what was asked and how it was phrased. They are NOT a source of facts: every factual claim -- including in a related-topic answer -- must come from academy_docs, even if an earlier reply in this conversation stated it. If academy_docs does not answer the latest question and returned nothing meaningfully related either, reply with exactly NOT_IN_DOCUMENTS even when the conversation appears to contain the answer.",
           "maxIterations": 6,
           "returnIntermediateSteps": true
         }
@@ -161,7 +161,7 @@
       ],
       "credentials": {
         "openAiApi": {
-          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "id": "litellmLocal001",
           "name": "LiteLLM (ai-network)"
         }
       },
@@ -189,7 +189,7 @@
       ],
       "credentials": {
         "chromaSelfHostedApi": {
-          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "id": "chromaLocal0001",
           "name": "Chroma (ai-network)"
         }
       },
@@ -213,7 +213,7 @@
       ],
       "credentials": {
         "openAiApi": {
-          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "id": "litellmLocal001",
           "name": "LiteLLM (ai-network)"
         }
       },
@@ -266,8 +266,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1392,
-        240
+        1360,
+        304
       ],
       "notes": "Academic mail the documents cannot answer. No draft: an auto-reply saying nothing is worse than silence, and the email is still sitting in the inbox for a human. Point this at a notification channel when there is one."
     },
@@ -277,7 +277,7 @@
         "url": "http://classifier:8100/threads/reply",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ conversation_id: $('Finalize').item.json.conversation_id, reply: $('Finalize').item.json.reply, subject: $('Finalize').item.json.subject, grounded: true, resume_url: $execution.resumeUrl }) }}",
+        "jsonBody": "={{ JSON.stringify({ conversation_id: $('Finalize').item.json.conversation_id, reply: $('Finalize').item.json.reply, subject: $('Finalize').item.json.subject, grounded: true, resume_url: $execution.resumeUrl, exchange_id: $('Finalize').item.json.exchange_id }) }}",
         "options": {
           "timeout": 60000
         }
@@ -287,8 +287,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1728,
-        -32
+        1712,
+        -96
       ],
       "onError": "continueRegularOutput",
       "notes": "The other half of the memory: without it the store keeps the enquirer's questions and none of the answers, and the next email is shown a conversation in which nobody replied.\n\nQueues the reply for a human at /review instead of creating an Outlook draft. Nothing sends until a person reviews it there and clicks Send (mail/graph.py). `resume_url` is this execution's Wait-node resume webhook (see Wait for review, next) -- /review/{id}/send POSTs to it once the human sends, so this execution doesn't just fire-and-forget."
@@ -299,7 +299,7 @@
         "url": "http://classifier:8100/emails/prepare",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ body: ($json.body && $json.body.content) ? $json.body.content : ($json.bodyPreview || ''), is_html: !($json.body && $json.body.contentType === 'text'), subject: $json.subject || '', conversation_id: $json.conversationId || '', message_id: $json.internetMessageId || $json.id || '', ref: $json.id || '' }) }}",
+        "jsonBody": "={{ JSON.stringify({ body: ($json.body && $json.body.content) ? $json.body.content : ($json.bodyPreview || ''), is_html: !($json.body && $json.body.contentType === 'text'), subject: $json.subject || '', conversation_id: $json.conversationId || '', message_id: $json.internetMessageId || $json.id || '', ref: $json.id || '', from_email: ($json.from && $json.from.emailAddress) ? $json.from.emailAddress.address : '' }) }}",
         "options": {
           "timeout": 180000
         }
@@ -321,7 +321,7 @@
         "url": "http://classifier:8100/emails/finalize",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ output: $json.output || '', subject: $('Prepare').item.json.subject || '', conversation_id: $('Prepare').item.json.conversation_id, format: $('Prepare').item.json.format }) }}",
+        "jsonBody": "={{ JSON.stringify({ output: $json.output || '', subject: $('Prepare').item.json.subject || '', conversation_id: $('Prepare').item.json.conversation_id, format: $('Prepare').item.json.format, exchange_id: $('Prepare').item.json.exchange_id }) }}",
         "options": {
           "timeout": 60000
         }
@@ -338,26 +338,16 @@
       "notes": "Everything decidable once the answer exists: was it grounded, and what does the draft read like.\n\nBoth halves used to live in this canvas -- the refusal test as two regexes inside an IF condition, the greeting and sign-off as string concatenation in a Code node. Both were copies of rag.core, and a copied safety check is one that will eventually disagree with itself. They are now one implementation, covered by scripts/rag_eval.py.\n\nThe refusal test is deliberately two nets: the NOT_IN_DOCUMENTS token leaks. Measured on seven unanswerable questions the 9B emitted the token for four and answered the other three in prose -- 'the provided documentation does not specify how many days' -- a well-formed answer that says nothing. `reason` distinguishes them, so you can tell a corpus gap from a model that will not say so.\n\nThe shell is assembled here and never by the model. Retrieval grounds the factual body; letting the model write the courtesy around it reopens the gap it was stopped from filling ('we look forward to seeing you at our campus')."
     },
     {
-      "parameters": {
-        "resume": "webhook",
-        "httpMethod": "POST",
-        "responseCode": 200,
-        "responseMode": "onReceived",
-        "responseData": "firstEntryJson",
-        "options": {},
-        "limitWaitTime": true,
-        "limitType": "afterTimeInterval",
-        "resumeAmount": 14,
-        "resumeUnit": "days"
-      },
+      "parameters": {},
       "id": "wait-for-review",
       "name": "Wait for review",
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1.1,
       "position": [
-        2048,
-        -32
+        2016,
+        -96
       ],
+      "webhookId": "2948b21a-ab10-43e5-952b-f80aeb1317ce",
       "notes": "Holds the execution open until a human approves on /review and clicks Send -- review_send() in api.py POSTs to $execution.resumeUrl (captured by Record reply, previous node) once the Graph send actually succeeds. Capped at 14 days (limitWaitTime/resumeAmount below): past that, n8n auto-resumes and this execution just ends -- the reply is still sitting in the review queue, sendable by hand any time regardless of this workflow's state."
     }
   ],

@@ -7,9 +7,11 @@ from .core import (
     Answer,
     Chunk,
     answer,
+    answer_followup,
     chunk_markdown,
     default_docs,
     ingest,
+    is_near_duplicate,
     retrieve,
 )
 from .format_hint import resolve as resolve_format
@@ -28,9 +30,11 @@ __all__ = [
     "Answer",
     "Chunk",
     "answer",
+    "answer_followup",
     "chunk_markdown",
     "default_docs",
     "ingest",
+    "is_near_duplicate",
     "load_text",
     "retrieve",
 ]

@@ -4,36 +4,83 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ReviewRow from "../components/ReviewRow";
 import HistoryRow from "../components/HistoryRow";
 import RowHeader from "../components/RowHeader";
+import ThreadCard from "../components/ThreadCard";
 import { fetchHistory, fetchQueue } from "../lib/api";
 
-const REVIEW_LABELS = ["Email", "Enquiry", "AI reply", "Edit & send"];
-const HISTORY_LABELS = ["Email", "Enquiry", "AI reply", "Sent"];
+const REVIEW_LABELS = ["Received / drafted", "Enquiry", "AI reply", "Edit & send"];
+const HISTORY_LABELS = ["Received / sent", "Enquiry", "AI reply", "Sent"];
 
 const POLL_MS = 20000;
 
+function totalExchanges(groups) {
+  return groups.reduce((n, g) => n + g.exchanges.length, 0);
+}
+
+// History only (see Case 1b discussion: pending stays in drafted order --
+// oldest-first review order matters more there than clustering). Reorders,
+// nothing else -- same cards, same ThreadCard, just placed so the same
+// sender's threads sit next to each other instead of scattered by whenever
+// they happened to send. Groups with no captured sender_email keep their
+// own original position rather than clustering with each other, same
+// reasoning as sender_threads()'s blank-address guard: two blanks are not
+// evidence of the same person.
+function clusterBySender(groups) {
+  const withIndex = groups.map((group, i) => ({ group, i }));
+  const firstIndexBySender = new Map();
+  for (const { group, i } of withIndex) {
+    if (group.sender_email && !firstIndexBySender.has(group.sender_email)) {
+      firstIndexBySender.set(group.sender_email, i);
+    }
+  }
+  const rankOf = ({ group, i }) =>
+    group.sender_email ? firstIndexBySender.get(group.sender_email) : i;
+  return withIndex
+    .slice()
+    .sort((a, b) => rankOf(a) - rankOf(b) || a.i - b.i)
+    .map(({ group }) => group);
+}
+
 export default function Page() {
-  const [rows, setRows] = useState([]);
-  const [history, setHistory] = useState([]);
+  // Each entry: { conversation_id, conversation_subject, exchanges: [...] }
+  // -- one card per thread, not one row per reply. See lib/api.js.
+  const [groups, setGroups] = useState([]);
+  const [historyGroups, setHistoryGroups] = useState([]);
   const [error, setError] = useState(null);
   const [dryRun, setDryRun] = useState(false);
-  // Rows mid Send -> fade-out. A poll landing in that ~800ms window would
-  // otherwise see the row already gone from the backend (the send already
-  // succeeded) and yank it out of `rows` immediately, cutting the fade short.
+  // Exchanges mid Send -> fade-out, keyed by exchange id. A poll landing in
+  // that ~800ms window would otherwise see the exchange already gone from
+  // the backend (the send already succeeded) and yank it out immediately,
+  // cutting the fade short -- so a fading exchange is stitched back into its
+  // group (creating a one-off group if the thread had no other pending
+  // exchange left) until its own timeout clears it via handleRemove.
   const fadingRef = useRef(new Map());
 
   const load = useCallback(async () => {
     try {
-      const [{ pending, dryRun }, historyRows] = await Promise.all([
+      const [{ groups: freshGroups, dryRun }, historyRows] = await Promise.all([
         fetchQueue(),
         fetchHistory(),
       ]);
       setError(null);
       setDryRun(dryRun);
-      setHistory(historyRows);
-      setRows(() => {
-        const merged = [...pending];
-        for (const [id, snapshot] of fadingRef.current) {
-          if (!merged.some((r) => r.id === id)) merged.push(snapshot);
+      setHistoryGroups(historyRows);
+      setGroups(() => {
+        const merged = freshGroups.map((g) => ({ ...g, exchanges: [...g.exchanges] }));
+        const byConversation = new Map(merged.map((g) => [g.conversation_id, g]));
+        for (const [exchangeId, snapshot] of fadingRef.current) {
+          let group = byConversation.get(snapshot.conversationId);
+          if (!group) {
+            group = {
+              conversation_id: snapshot.conversationId,
+              conversation_subject: snapshot.conversationSubject,
+              exchanges: [],
+            };
+            byConversation.set(snapshot.conversationId, group);
+            merged.push(group);
+          }
+          if (!group.exchanges.some((e) => e.id === exchangeId)) {
+            group.exchanges.push(snapshot.exchange);
+          }
         }
         return merged;
       });
@@ -48,15 +95,29 @@ export default function Page() {
     return () => clearInterval(id);
   }, [load]);
 
-  function handleSendSuccess(row) {
-    fadingRef.current.set(row.id, row);
+  function handleSendSuccess(group, exchange) {
+    fadingRef.current.set(exchange.id, {
+      conversationId: group.conversation_id,
+      conversationSubject: group.conversation_subject,
+      exchange,
+    });
   }
 
-  function handleRemove(id) {
-    fadingRef.current.delete(id);
-    setRows((rs) => rs.filter((r) => r.id !== id));
-    load(); // pulls the just-sent row into History right away, not on the next 20s tick
+  function handleRemove(conversationId, exchangeId) {
+    fadingRef.current.delete(exchangeId);
+    setGroups((gs) =>
+      gs
+        .map((g) =>
+          g.conversation_id === conversationId
+            ? { ...g, exchanges: g.exchanges.filter((e) => e.id !== exchangeId) }
+            : g
+        )
+        .filter((g) => g.exchanges.length > 0)
+    );
+    load(); // pulls the just-sent exchange into History right away, not on the next 20s tick
   }
+
+  const pendingCount = totalExchanges(groups);
 
   return (
     <div className="wrap">
@@ -66,7 +127,7 @@ export default function Page() {
       <header>
         <h1>Reply review</h1>
         <div className="toolbar">
-          <span className="count">{rows.length ? `${rows.length} pending` : ""}</span>
+          <span className="count">{pendingCount ? `${pendingCount} pending` : ""}</span>
           <button type="button" onClick={load}>Refresh</button>
         </div>
       </header>
@@ -76,33 +137,51 @@ export default function Page() {
         {error && (
           <div id="loadError">Could not load the review queue: {error}</div>
         )}
-        {!error && rows.length === 0 && (
+        {!error && groups.length === 0 && (
           <div id="empty">Nothing waiting for review.</div>
         )}
-        <div className="board">
-          {rows.length > 0 && <RowHeader labels={REVIEW_LABELS} />}
-          {rows.map((row) => (
-            <ReviewRow
-              key={row.id}
-              row={row}
-              onSendSuccess={handleSendSuccess}
-              onRemove={handleRemove}
-            />
-          ))}
-        </div>
+        {groups.map((group) => (
+          <ThreadCard
+            key={group.conversation_id}
+            subject={group.conversation_subject}
+            conversationId={group.conversation_id}
+            senderEmail={group.sender_email}
+            otherOpenThreads={group.other_open_threads}
+            otherSentThreads={group.other_sent_threads}
+          >
+            <RowHeader labels={REVIEW_LABELS} />
+            {group.exchanges.map((exchange) => (
+              <ReviewRow
+                key={exchange.id}
+                row={exchange}
+                onSendSuccess={(sentExchange) => handleSendSuccess(group, sentExchange)}
+                onRemove={(exchangeId) => handleRemove(group.conversation_id, exchangeId)}
+              />
+            ))}
+          </ThreadCard>
+        ))}
       </section>
 
       <section>
         <h2 className="section-title">History</h2>
-        {!error && history.length === 0 && (
+        {!error && historyGroups.length === 0 && (
           <div id="empty">Nothing sent yet.</div>
         )}
-        <div className="board">
-          {history.length > 0 && <RowHeader labels={HISTORY_LABELS} />}
-          {history.map((row) => (
-            <HistoryRow key={row.id} row={row} />
-          ))}
-        </div>
+        {clusterBySender(historyGroups).map((group) => (
+          <ThreadCard
+            key={group.conversation_id}
+            subject={group.conversation_subject}
+            conversationId={group.conversation_id}
+            senderEmail={group.sender_email}
+            otherOpenThreads={group.other_open_threads}
+            otherSentThreads={group.other_sent_threads}
+          >
+            <RowHeader labels={HISTORY_LABELS} />
+            {group.exchanges.map((exchange) => (
+              <HistoryRow key={exchange.id} row={exchange} />
+            ))}
+          </ThreadCard>
+        ))}
       </section>
     </div>
   );

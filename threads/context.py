@@ -82,9 +82,26 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def render(exchanges: list[Exchange]) -> str:
-    """The history block, oldest first: each turn's query, then its reply if any."""
+    """The history block, oldest first: each turn's query, then its reply if any.
+
+    A follow-up (threads.store.create_followup) is not a turn the enquirer
+    took part in -- `query` holds a topic label the system chose, not
+    something they wrote, and pairing it under "Enquirer:" would put words
+    in their mouth they never said, then feed that fabrication back to the
+    model as if it were real conversation history. It renders as our own
+    message instead, with no "Enquirer:" line at all, and only once actually
+    sent -- a follow-up still sitting in the review queue has not reached
+    them yet, so it is not part of the conversation as far as they know.
+    """
     lines = []
     for exchange in exchanges:
+        if exchange.is_followup:
+            if exchange.sent:
+                lines.append(
+                    f"Our follow-up (unprompted, not a reply to anything "
+                    f"they asked):\n{_truncate(exchange.reply or '', MAX_MESSAGE_CHARS)}"
+                )
+            continue
         lines.append(f"Enquirer:\n{_truncate(exchange.query, MAX_MESSAGE_CHARS)}")
         if exchange.answered:
             lines.append(f"Our reply:\n{_truncate(exchange.reply, MAX_MESSAGE_CHARS)}")

@@ -445,6 +445,42 @@ def embed(texts: list[str], *, timeout: int = 180) -> list[list[float]]:
     return vectors
 
 
+# Cosine distance cutoff for "these two questions mean nearly the same
+# thing," not "this chunk is on-topic" -- MAX_DISTANCE above answers a very
+# different question (is a retrieved passage worth showing the model at
+# all) and is an order of magnitude looser. Measured against bge-m3 on five
+# pairs: three genuine near-duplicates (a straight rewording, an "also
+# checking" nudge, a synonym swap) landed at 0.019-0.186; two genuinely
+# different questions on the same or an adjacent topic landed at 0.27+. 0.22
+# sits in that gap. Still worth re-checking against real traffic, not a
+# guarantee that gap holds in general.
+DUPLICATE_MAX_DISTANCE = float(os.environ.get("RAG_DUPLICATE_MAX_DISTANCE", "0.22"))
+
+
+def is_near_duplicate(a: str, b: str, *, max_distance: float = DUPLICATE_MAX_DISTANCE) -> bool:
+    """True when `a` and `b` are close enough in meaning to be the same
+    question reworded, not two different ones.
+
+    Used to stop a re-ask or an impatiently reworded follow-up from getting
+    a second, redundant draft while the first is still sitting unanswered
+    on the same thread (see api.py's /emails/prepare) -- a genuinely new
+    question on the same thread must still pass through untouched, which is
+    the whole reason this needs a real embedding comparison rather than a
+    substring or keyword check.
+    """
+    a, b = a.strip(), b.strip()
+    if not a or not b:
+        return False
+    vec_a, vec_b = embed([a, b])
+    dot = sum(x * y for x, y in zip(vec_a, vec_b))
+    norm_a = sum(x * x for x in vec_a) ** 0.5
+    norm_b = sum(x * x for x in vec_b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return False
+    distance = 1 - (dot / (norm_a * norm_b))
+    return distance <= max_distance
+
+
 def _client() -> chromadb.api.ClientAPI:
     return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 
@@ -689,6 +725,104 @@ def answer(
     # often still answers a multi-part question in one paragraph. Split it.
     if as_list:
         text = as_bullets(text)
+
+    return Answer(text=text, chunks=kept, grounded=True)
+
+
+# Used by answer_followup() instead of SYSTEM/THREAD_SYSTEM: a follow-up is
+# not answering a question, it is proactively continuing a thread, so the
+# framing has to change even though the grounding rules do not. Still built
+# from the same extracts, still never invents a fact, still falls back to
+# NO_ANSWER -- ground() applies identically either way.
+FOLLOWUP_SYSTEM = f"""You are writing a proactive follow-up email on an
+existing training-programme enquiry. Nothing new has arrived from the
+enquirer -- you are the one starting this message, about the topic given
+below, using only the documentation extracts provided.
+
+Rules:
+- Use only the extracts. Never use outside knowledge, and never guess a date,
+  a price, a duration or a prerequisite that is not written in them, for the
+  same reason as any other reply from this system: an invented specific is
+  worse than none.
+- If the extracts do not contain anything to say about the topic, reply with
+  exactly {NO_ANSWER} and nothing else -- a human will handle this one
+  directly rather than receive a fabricated follow-up.
+- Do not open as if replying to a question ("Thank you for your question",
+  "Regarding your enquiry...") -- there was not one. Open as someone
+  continuing a conversation on their own initiative.
+- Do not ask the enquirer to confirm, reply, or acknowledge receipt. This
+  message is informational -- it must read as complete on its own, not as
+  something waiting on a response.
+- Quote the specific module names and details from the extracts rather than
+  paraphrasing them vaguely.
+- Keep it short: at most four sentences of plain prose, OR a list of at most
+  six short points, whichever fits the topic better.
+- Address the enquirer directly. Do not mention "extracts", "context",
+  "documents", or that this is an automated or scheduled message."""
+
+
+def answer_followup(
+    topic: str,
+    *,
+    model: str = SMALL_MODEL,
+    k: int = TOP_K,
+    max_distance: float = MAX_DISTANCE,
+    timeout: int = 120,
+) -> Answer:
+    """Draft a scheduled follow-up from `topic` (see threads.store.create_followup).
+
+    Structurally the same as `answer()` -- retrieve, ground, decide -- with
+    two differences: FOLLOWUP_SYSTEM's proactive framing instead of
+    SYSTEM/THREAD_SYSTEM's answer-a-question framing, and no reply-shape
+    (`as_list`) handling, since a scheduler has no enquirer wording to read
+    a shape from. `grounded=False` here means the same thing it always does:
+    nothing was found worth saying, so this stays out of the review queue
+    rather than risk sending an empty or invented follow-up.
+    """
+    try:
+        chunks = retrieve(topic, k=k)
+    except Exception as exc:
+        return Answer(error=f"retrieval failed: {exc}")
+
+    if not chunks:
+        return Answer(text="", chunks=[], grounded=False)
+
+    kept = [chunk for chunk in chunks if chunk.distance <= max_distance]
+    if not kept:
+        return Answer(chunks=chunks, grounded=False)
+
+    context = "\n\n---\n\n".join(f"[{c.heading}]\n{c.text}" for c in kept)
+    prompt = f"Documentation extracts:\n\n{context}\n\nTopic: {topic}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": FOLLOWUP_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": 500,
+    }
+    if NUM_CTX:
+        payload["options"] = {"num_ctx": int(NUM_CTX)}
+
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/chat/completions",
+            json=payload,
+            headers=auth_headers(),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+    except requests.RequestException as exc:
+        return Answer(chunks=kept, error=f"request failed: {exc}")
+    except (KeyError, IndexError, ValueError) as exc:
+        return Answer(chunks=kept, error=f"malformed response: {exc}")
+
+    text = ground(text)
+    if not text:
+        return Answer(text="", chunks=kept, grounded=False)
 
     return Answer(text=text, chunks=kept, grounded=True)
 

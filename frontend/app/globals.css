@@ -66,6 +66,7 @@ button {
   border-radius: 5px;
   padding: 5px 10px;
   font-size: 12px;
+  transition: border-color .15s, background-color .15s, opacity .15s;
 }
 button:hover { border-color: var(--muted-2); }
 button.primary {
@@ -74,6 +75,7 @@ button.primary {
   border-color: var(--accent);
   font-weight: 600;
 }
+button.primary:hover { opacity: .85; }
 /* .busy (not the native `disabled` attribute) blocks re-clicks on the Send
    button. Disabling the element that just received focus from the click
    makes the browser drop focus to <body>, and Chrome resets scroll to the
@@ -99,7 +101,9 @@ button.link:hover { color: var(--text); }
   gap: 22px;
   padding: 18px 0;
   border-top: 1px solid var(--line);
+  transition: background-color .15s;
 }
+.row:not(.header-row):hover { background: var(--line-soft); }
 .row.sent { opacity: .38; }
 .col { min-width: 0; }
 .label {
@@ -142,11 +146,55 @@ button.link:hover { color: var(--text); }
   color: var(--muted-2);
 }
 
+/* Marks a row whose "enquiry" column is really a scheduled topic, not
+   something the enquirer wrote -- see ReviewRow/HistoryRow is_followup.
+   Given its own tint (not just --line-soft grey) so it reads as a distinct
+   signal at a glance, not another muted label. */
+.followup-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: #6b5300;
+  background: #fff6da;
+  border-radius: 4px;
+  padding: 2px 7px;
+  margin-bottom: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  .followup-badge { background: #3a3010; color: #f0d878; }
+}
+
 /* Grid cells stretch to the row's full height by default, so a flex column
    here plus margin-top:auto on the actions pins Reset/Send to the bottom
    right of the row regardless of how tall the other columns are. */
 .edit-cell { display: flex; flex-direction: column; }
 .edit-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: auto; padding-top: 10px; }
+
+/* Plain-text selection transforms above the edit box -- see lib/textFormat
+   for why Bold/Italic are markers, not real formatting. */
+.format-toolbar { display: flex; align-items: center; gap: 4px; margin-bottom: 6px; }
+.format-toolbar button {
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.format-toolbar-sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+  margin: 0 2px;
+}
+.format-bold { font-weight: 700; }
+.format-italic { font-style: italic; }
+.format-note {
+  font-size: 10.5px;
+  color: var(--muted-2);
+  margin-top: 4px;
+  line-height: 1.4;
+}
 textarea {
   width: 100%;
   min-height: 6.5em;
@@ -159,8 +207,13 @@ textarea {
   border-radius: 6px;
   background: transparent;
   color: var(--text);
+  transition: border-color .15s, box-shadow .15s;
 }
-textarea:focus { outline: none; border-color: var(--muted-2); }
+textarea:focus {
+  outline: none;
+  border-color: var(--muted-2);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--muted-2) 20%, transparent);
+}
 .status { font-size: 11.5px; margin-top: 7px; }
 .status.error { color: var(--danger); }
 .status.ok { color: var(--ok); }
@@ -187,11 +240,106 @@ section + section { margin-top: 64px; }
 }
 .header-row .label { margin-bottom: 0; }
 
+/* One card per conversation, wrapping all of that thread's rows -- the
+   .board/.row grid inside is unchanged, just no longer flush against the
+   page since the card owns the subject/conversation-id header instead. */
+.thread-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 18px;
+  margin-top: 16px;
+  transition: background-color .3s, border-color .2s;
+}
+.thread-card:first-child { margin-top: 0; }
+/* Jump target for an "other open thread" chip click -- a quick pulse so the
+   card that was scrolled to is obvious, then fades back to normal. */
+.thread-card.flash { background: color-mix(in srgb, var(--accent) 8%, transparent); border-color: var(--muted-2); }
+.thread-card-header {
+  padding: 14px 0 10px;
+}
+.thread-card-header-main {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.thread-subject {
+  font-weight: 600;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-conv {
+  color: var(--muted-2);
+  font-size: 10.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  flex-shrink: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Case 1b: other open threads from the same sender -- a signal for the
+   reviewer to notice, not a badge that needs to shout. Each one is a
+   clickable chip (see ThreadCard's jumpTo) rather than a plain sentence,
+   so "there's more from this person" is something you can act on, not
+   just read. */
+.thread-other-open {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.thread-other-open-label {
+  font-size: 11px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.thread-other-open-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.thread-other-open-chip {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-other-open-chip:hover {
+  border-color: var(--muted-2);
+  background: var(--line-soft);
+}
+/* First row's own top border would double up with the header's bottom
+   edge -- the header-row (column labels) already draws that line. */
+.thread-card .board .header-row { border-top: 1px solid var(--line); }
+.thread-card .board > .row:last-child { padding-bottom: 20px; }
+
+@media (max-width: 860px) {
+  .thread-card-header-main { flex-direction: column; gap: 2px; }
+  .thread-conv { max-width: 100%; }
+}
+
 .edited-note {
   font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: .04em;
+  letter-spacing: r { background: #3a3010; color: #f0d878; border-color: #5c4a17; }
+}
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 22px; flex-wrap: wrap; }
+h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+.count { color: var(--muted); font-size: 12px; }
+.toolbar { display: flex; gap: 10px; align-items: center; }
+
+button {.04em;
   color: var(--muted-2);
   margin-bottom: 6px;
 }

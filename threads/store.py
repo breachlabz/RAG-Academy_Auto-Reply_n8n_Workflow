@@ -117,6 +117,23 @@ _ADDED_COLUMNS = {
     # approves. NULL for rows recorded before this existed, or by a caller
     # that never waits on review (e.g. the one-call /generate-reply path).
     "resume_url": "TEXT",
+    # A scheduled follow-up on a thread, not a reply to a real inbound
+    # question -- see create_followup(). `query` holds the topic (what to
+    # draft about) rather than something the enquirer wrote, and `due_at` is
+    # when a scheduler should draft and surface it. A row with is_followup=0
+    # (every row before this existed) is an ordinary enquiry/reply turn.
+    "is_followup": "INTEGER NOT NULL DEFAULT 0",
+    "due_at": "TEXT",
+}
+
+# Same idea, for conversations. Normalised (lowercase, trimmed) at write time
+# in ensure_conversation -- comparing addresses case- or whitespace-sensitively
+# would silently fail to notice "John@X.com" and "john@x.com" are the same
+# sender. Blank for a conversation whose inbound email carried no `from`
+# (a manual test, a transport that has no such concept) -- sender_threads()
+# below is a no-op for those, not an error.
+_ADDED_COLUMNS_CONVERSATIONS = {
+    "sender_email": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -125,6 +142,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for column, decl in _ADDED_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE exchanges ADD COLUMN {column} {decl}")
+
+    existing_conv = {
+        row["name"] for row in conn.execute("PRAGMA table_info(conversations)")
+    }
+    for column, decl in _ADDED_COLUMNS_CONVERSATIONS.items():
+        if column not in existing_conv:
+            conn.execute(f"ALTER TABLE conversations ADD COLUMN {column} {decl}")
+
+    # Index creation deferred to here rather than the static SCHEMA string --
+    # sender_email does not exist yet on a fresh database until the ALTER
+    # TABLE above runs, so an index on it inside CREATE TABLE IF NOT EXISTS
+    # would fail on first boot.
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS conversations_by_sender
+               ON conversations (sender_email) WHERE sender_email != ''"""
+    )
 
 
 @dataclass
@@ -139,6 +172,12 @@ class Exchange:
     grounded: bool | None = None
     created_at: str = ""
     replied_at: str | None = None
+    # True for a scheduled follow-up (see create_followup): `query` is a
+    # topic label the system chose, not something the enquirer wrote. See
+    # threads.context.render, the one place this distinction actually
+    # matters -- everywhere else an Exchange is just a row.
+    is_followup: bool = False
+    sent: bool = False
 
     @property
     def answered(self) -> bool:
@@ -197,21 +236,38 @@ def thread_key(conversation_id: str | None, subject: str = "") -> str:
 # --- Writes -----------------------------------------------------------------
 
 
+def normalise_email(address: str | None) -> str:
+    """Lowercase and trimmed, so "John@X.com" and "john@x.com " compare equal.
+    "" for anything blank -- never raises on a malformed or missing address."""
+    return (address or "").strip().lower()
+
+
 def ensure_conversation(
-    conversation_id: str, subject: str = "", *, path: pathlib.Path | None = None
+    conversation_id: str,
+    subject: str = "",
+    *,
+    sender_email: str = "",
+    path: pathlib.Path | None = None,
 ) -> None:
+    sender_email = normalise_email(sender_email)
     with connect(path) as conn:
         conn.execute(
             """INSERT INTO conversations
-                   (conversation_id, subject, created_at, updated_at)
-               VALUES (?, ?, ?, ?)
+                   (conversation_id, subject, sender_email, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(conversation_id) DO UPDATE SET
                    updated_at = excluded.updated_at,
                    -- Keep the first subject seen; later ones carry "Re:" noise.
                    subject = CASE WHEN conversations.subject = ''
                                   THEN excluded.subject
-                                  ELSE conversations.subject END""",
-            (conversation_id, subject or "", _now(), _now()),
+                                  ELSE conversations.subject END,
+                   -- Same for sender_email -- fill it in if it was missing
+                   -- (an older row, or a caller that did not have it yet),
+                   -- never overwrite one already on record.
+                   sender_email = CASE WHEN conversations.sender_email = ''
+                                  THEN excluded.sender_email
+                                  ELSE conversations.sender_email END""",
+            (conversation_id, subject or "", sender_email, _now(), _now()),
         )
 
 
@@ -222,22 +278,31 @@ def record_inbound(
     subject: str = "",
     message_id: str | None = None,
     ref: str | None = None,
+    sender_email: str = "",
     path: pathlib.Path | None = None,
-) -> bool:
-    """Open a new turn for an arriving email. False if message_id was already stored.
+) -> int | None:
+    """Open a new turn for an arriving email. Returns the new row's id, or
+    None if message_id was already stored.
 
-    The caller is expected to branch on the return value: a False means the
-    trigger delivered something already handled, and drafting a second reply to
-    it would put two drafts in the mailbox for one email.
+    The caller is expected to branch on the return value: None means the
+    trigger delivered something already handled, and drafting a second reply
+    to it would put two drafts in the mailbox for one email. A real id
+    should be threaded all the way through to record_reply's `exchange_id`
+    -- see there for why guessing "the most recent unanswered turn" instead
+    is not safe once more than one row on a thread can be unanswered at once
+    (a near-duplicate suppressed by is_near_duplicate stays that way
+    forever; a genuine race between two fast inbound emails is rarer but not
+    impossible).
 
     `ref` is Graph's message id for this email (Prepare's `ref`), stored so the
     review queue can send a reply to the right message without going back
-    through n8n.
+    through n8n. `sender_email` is who it was from -- lets sender_threads()
+    below tell a reviewer this enquirer has other open threads.
     """
-    ensure_conversation(conversation_id, subject, path=path)
+    ensure_conversation(conversation_id, subject, sender_email=sender_email, path=path)
     with connect(path) as conn:
         try:
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO exchanges
                        (conversation_id, query, query_subject, message_id, ref,
                         created_at)
@@ -245,8 +310,8 @@ def record_inbound(
                 (conversation_id, body, subject or "", message_id, ref, _now()),
             )
         except sqlite3.IntegrityError:
-            return False  # exchanges_dedupe fired: same internetMessageId.
-    return True
+            return None  # exchanges_dedupe fired: same internetMessageId.
+    return cur.lastrowid
 
 
 def record_reply(
@@ -256,31 +321,149 @@ def record_reply(
     subject: str = "",
     grounded: bool = False,
     resume_url: str | None = None,
+    exchange_id: int | None = None,
     path: pathlib.Path | None = None,
 ) -> None:
-    """Fill in the reply half of the most recently opened, still-unanswered turn.
+    """Fill in the reply half of a turn.
 
-    Drafted, not sent -- nothing here is ever sent. Pairs with the `record_inbound`
-    call for the same conversation earlier in the same request; every caller in
-    this codebase records the inbound and then, once it has an answer, records
-    the reply before handling anything else for that conversation, so "the most
-    recent unanswered row" is always the one this reply belongs to.
+    `exchange_id`, when given, targets that exact row -- always prefer this.
+    The split Outlook path (Prepare -> Finalize -> /threads/reply) threads
+    the id `record_inbound` returned all the way through for exactly this.
+
+    Without it, falls back to guessing "the most recently opened, still-
+    unanswered turn" -- kept only for the one-call /generate-reply path,
+    where this runs synchronously right after `record_inbound` in the same
+    request with nothing else able to create a newer unanswered row in
+    between, so there is nothing for the guess to get wrong. On any path
+    where the inbound and the reply are two separate requests, the guess is
+    not safe: a near-duplicate suppressed by `is_near_duplicate` sits at
+    `reply IS NULL` forever (see api.py), and if it is the most recent such
+    row when an unrelated reply gets recorded, that reply lands on it
+    instead of the turn it actually answers.
 
     `resume_url` is n8n's `$execution.resumeUrl` for the Wait node paused
     right after this reply was recorded, when the caller is that workflow.
+
+    Excludes `is_followup` rows from the fallback guess either way: a
+    scheduled follow-up (see `create_followup`) also sits at `reply IS
+    NULL` until its own `draft_followup` fills it in, and is never what an
+    ordinary reply is meant for.
     """
     ensure_conversation(conversation_id, subject, path=path)
     with connect(path) as conn:
+        if exchange_id is not None:
+            conn.execute(
+                """UPDATE exchanges
+                      SET reply = ?, reply_subject = ?, grounded = ?, replied_at = ?,
+                          resume_url = ?
+                    WHERE id = ? AND conversation_id = ? AND is_followup = 0""",
+                (body, subject or "", int(grounded), _now(), resume_url, exchange_id, conversation_id),
+            )
+            return
         conn.execute(
             """UPDATE exchanges
                   SET reply = ?, reply_subject = ?, grounded = ?, replied_at = ?,
                       resume_url = ?
                 WHERE id = (
                     SELECT id FROM exchanges
-                     WHERE conversation_id = ? AND reply IS NULL
+                     WHERE conversation_id = ? AND reply IS NULL AND is_followup = 0
                      ORDER BY id DESC LIMIT 1
                 )""",
             (body, subject or "", int(grounded), _now(), resume_url, conversation_id),
+        )
+
+
+# --- Follow-ups ---------------------------------------------------------
+#
+# A follow-up is a turn with no real inbound question behind it -- the
+# system owes the enquirer a second message that isn't contingent on them
+# writing back first (see project discussion: "a reply that doesn't expect
+# anything from the user as acknowledgement"). Modelled as an ordinary
+# `exchanges` row rather than a separate table: `query` holds a short topic
+# label instead of something the enquirer wrote, `is_followup=1` marks it,
+# and `due_at` is when a scheduler should draft it. Once drafted it is
+# indistinguishable from any other row to `pending_review()`/`sent_history()`
+# -- same review queue, same Send path, same sent-only-after-a-real-send
+# guarantee -- so nothing downstream needed to change for this to work.
+#
+# Each stage is independent: scheduling a second follow-up is just another
+# call to `create_followup`, not a link in a chain. A stage that never gets
+# reviewed cannot block or break a later one.
+
+
+def create_followup(
+    conversation_id: str,
+    topic: str,
+    due_at: str,
+    *,
+    subject: str = "",
+    ref: str | None = None,
+    path: pathlib.Path | None = None,
+) -> int:
+    """Schedule one follow-up stage on a conversation. Returns the new row's id.
+
+    `ref` is the Graph message id Send will reply to; when not given
+    explicitly it is looked up as the most recent `ref` seen anywhere on
+    this conversation, so the follow-up still threads into the right Outlook
+    conversation even though nothing arrived to carry a `ref` of its own.
+    """
+    ensure_conversation(conversation_id, subject, path=path)
+    with connect(path) as conn:
+        if ref is None:
+            row = conn.execute(
+                """SELECT ref FROM exchanges
+                    WHERE conversation_id = ? AND ref IS NOT NULL
+                    ORDER BY id DESC LIMIT 1""",
+                (conversation_id,),
+            ).fetchone()
+            ref = row["ref"] if row else None
+        cur = conn.execute(
+            """INSERT INTO exchanges
+                   (conversation_id, query, query_subject, ref, is_followup,
+                    due_at, created_at)
+               VALUES (?, ?, ?, ?, 1, ?, ?)""",
+            (conversation_id, topic, subject or "", ref, due_at, _now()),
+        )
+        return cur.lastrowid
+
+
+def due_followups(
+    *, before: str | None = None, path: pathlib.Path | None = None
+) -> list[dict]:
+    """Scheduled follow-ups whose due_at has passed and are not drafted yet,
+    earliest-due first. `before` overrides "now" for testing."""
+    cutoff = before or _now()
+    with connect(path) as conn:
+        rows = conn.execute(
+            """SELECT * FROM exchanges
+                WHERE is_followup = 1 AND reply IS NULL AND due_at <= ?
+                ORDER BY due_at""",
+            (cutoff,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def draft_followup(
+    exchange_id: int,
+    reply: str,
+    *,
+    grounded: bool = True,
+    path: pathlib.Path | None = None,
+) -> None:
+    """Fill in one scheduled follow-up's reply, by exact row id.
+
+    Unlike `record_reply`'s "most recently opened, still-unanswered turn"
+    heuristic, a follow-up is targeted by id -- a conversation can have
+    several independent follow-ups pending (or a follow-up pending
+    alongside a genuinely unanswered inbound turn) and each has to land on
+    the row it was actually drafted for, not whichever is most recent.
+    """
+    with connect(path) as conn:
+        conn.execute(
+            """UPDATE exchanges
+                  SET reply = ?, grounded = ?, replied_at = ?
+                WHERE id = ? AND is_followup = 1""",
+            (reply, int(grounded), _now(), exchange_id),
         )
 
 
@@ -324,6 +507,8 @@ def history(
             grounded=None if row["grounded"] is None else bool(row["grounded"]),
             created_at=row["created_at"],
             replied_at=row["replied_at"],
+            is_followup=bool(row["is_followup"]),
+            sent=bool(row["sent"]),
         )
         for row in rows
     ]
@@ -341,6 +526,85 @@ def get_summary(
             (conversation_id,),
         ).fetchone()
     return ("", 0) if row is None else (row["summary"], row["summarised_through"])
+
+
+def sender_threads(
+    sender_email: str,
+    *,
+    exclude_conversation_id: str | None = None,
+    path: pathlib.Path | None = None,
+) -> list[dict]:
+    """Other conversations from the same sender with something still open --
+    an unanswered question, or a grounded reply still awaiting review.
+
+    A visibility signal for a reviewer ("this enquirer has N other open
+    threads"), not something this codebase acts on by itself: a shared inbox
+    alias can have several different real people behind one address, so
+    whether that matters is a judgment call for a human, never an automatic
+    merge. "" for `sender_email` (no address captured on this conversation)
+    always returns nothing -- two blank addresses matching each other would
+    be a false link between enquirers who were never actually the same
+    person, not a real one.
+    """
+    sender_email = normalise_email(sender_email)
+    if not sender_email:
+        return []
+    with connect(path) as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT c.conversation_id, c.subject
+                 FROM conversations c
+                 JOIN exchanges e USING (conversation_id)
+                WHERE c.sender_email = ?
+                  AND c.conversation_id != ?
+                  AND (
+                        (e.reply IS NULL AND e.is_followup = 0)
+                     OR (e.reply IS NOT NULL AND e.grounded = 1 AND e.sent = 0)
+                      )
+                ORDER BY c.updated_at DESC""",
+            (sender_email, exclude_conversation_id or ""),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def sender_sent_threads(
+    sender_email: str,
+    *,
+    exclude_conversation_id: str | None = None,
+    limit: int = 20,
+    path: pathlib.Path | None = None,
+) -> list[dict]:
+    """Other conversations from the same sender that have at least one sent
+    reply -- the History-section counterpart to sender_threads() above.
+
+    Kept as a separate query rather than folding into one "all other
+    threads from this sender" call: sender_threads() answers "does this
+    person have something outstanding elsewhere" (used where open work
+    matters, the pending queue), this answers "what have we already sent
+    this person" (used in History, where everything shown is already
+    resolved and sender_threads() would always come back empty -- a fully
+    sent thread never counts as "open"). Every caller already knows which
+    question it's asking, so conflating them would only cost clarity.
+
+    Same identity caveat as sender_threads(): a visibility signal for a
+    human to read, never something this codebase merges or acts on by
+    itself. Same blank-address guard too.
+    """
+    sender_email = normalise_email(sender_email)
+    if not sender_email:
+        return []
+    with connect(path) as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT c.conversation_id, c.subject
+                 FROM conversations c
+                 JOIN exchanges e USING (conversation_id)
+                WHERE c.sender_email = ?
+                  AND c.conversation_id != ?
+                  AND e.sent = 1
+                ORDER BY c.updated_at DESC
+                LIMIT ?""",
+            (sender_email, exclude_conversation_id or "", limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def conversations(*, path: pathlib.Path | None = None) -> list[dict]:
@@ -372,7 +636,7 @@ def pending_review(*, path: pathlib.Path | None = None) -> list[dict]:
     """Grounded replies not yet sent, oldest first (first drafted, first reviewed)."""
     with connect(path) as conn:
         rows = conn.execute(
-            """SELECT e.*, c.subject AS conversation_subject
+            """SELECT e.*, c.subject AS conversation_subject, c.sender_email AS conversation_sender_email
                  FROM exchanges e
                  JOIN conversations c USING (conversation_id)
                 WHERE e.grounded = 1 AND e.reply IS NOT NULL AND e.sent = 0
@@ -389,7 +653,7 @@ def sent_history(
     edited before sending (`edited_reply` vs the original `reply`)."""
     with connect(path) as conn:
         rows = conn.execute(
-            """SELECT e.*, c.subject AS conversation_subject
+            """SELECT e.*, c.subject AS conversation_subject, c.sender_email AS conversation_sender_email
                  FROM exchanges e
                  JOIN conversations c USING (conversation_id)
                 WHERE e.sent = 1
