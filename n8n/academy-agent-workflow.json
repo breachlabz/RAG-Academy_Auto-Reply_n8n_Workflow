@@ -100,7 +100,7 @@
         128,
         304
       ],
-      "notes": "`proceed` is true only when the email classified as academic above the confidence threshold, with administrative and spam both clear, AND it has not already been handled. Anything else -- including a dead API, whose error shape has no `proceed` -- goes false.\n\nWhen this sends mail to 'Do nothing', open Prepare's output and read `reason`. It says which condition failed, in words."
+      "notes": "`proceed` is true only when the email classified as academic above the confidence threshold, with non_academic clear, AND it has not already been handled. Anything else -- including a dead API, whose error shape has no `proceed` -- goes false.\n\nWhen this sends mail to 'Do nothing', open Prepare's output and read `reason`. It says which condition failed, in words."
     },
     {
       "parameters": {},
@@ -112,7 +112,7 @@
         432,
         832
       ],
-      "notes": "Administrative, spam, unclassifiable and already-handled mail. No draft and no auto-reply: it sits in the inbox for a human.\n\nThis node's INPUT carries `reason` from Prepare, naming which check refused the email. Open it before assuming anything is broken."
+      "notes": "Non-academic (payments, records, spam), unclassifiable and already-handled mail. No draft and no auto-reply: it sits in the inbox for a human.\n\nThis node's INPUT carries `reason` from Prepare, naming which check refused the email. Open it before assuming anything is broken."
     },
     {
       "parameters": {

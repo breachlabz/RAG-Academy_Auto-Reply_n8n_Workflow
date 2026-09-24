@@ -1,9 +1,9 @@
 from .core import (
-    ADMIN_THRESHOLD,
     BASE_URL,
     DEFAULT_THRESHOLD,
     LABELS,
     LARGE_MODEL,
+    NON_ACADEMIC_THRESHOLD,
     SMALL_MODEL,
     Result,
     auth_headers,
@@ -12,11 +12,11 @@ from .core import (
 )
 
 __all__ = [
-    "ADMIN_THRESHOLD",
     "BASE_URL",
     "DEFAULT_THRESHOLD",
     "LABELS",
     "LARGE_MODEL",
+    "NON_ACADEMIC_THRESHOLD",
     "SMALL_MODEL",
     "Result",
     "auth_headers",

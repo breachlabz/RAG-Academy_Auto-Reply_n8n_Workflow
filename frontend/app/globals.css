@@ -250,6 +250,27 @@ textarea:focus {
   border-color: var(--muted-2);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--muted-2) 20%, transparent);
 }
+/* Drag bar under the edit box (ReviewRow's startResize): a visible grip in
+   place of the browser's easy-to-miss corner handle. Height only. */
+.edit-box { resize: none; display: block; }
+.edit-resize {
+  height: 10px;
+  margin-top: 2px;
+  cursor: ns-resize;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.edit-resize::before {
+  content: "";
+  width: 36px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+  transition: background-color .15s;
+}
+.edit-resize:hover::before { background: var(--muted-2); }
 .status { font-size: 11.5px; margin-top: 7px; }
 .status.error { color: var(--danger); }
 .status.ok { color: var(--ok); }
@@ -377,4 +398,101 @@ section + section { margin-top: 64px; }
   .row { grid-template-columns: 1fr; gap: 10px; }
   .header-row { display: none; } /* the 4 stacked columns don't need a legend at this width */
   .edit-actions { margin-top: 10px; }
+}
+
+/* --- Tabs: Reply review / Knowledge ----------------------------------- */
+.tabs { display: flex; gap: 4px; }
+.tab {
+  border: none;
+  border-radius: 6px;
+  padding: 5px 11px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.tab:hover { color: var(--text); background: var(--line-soft); }
+.tab.active { color: var(--text); background: var(--line); }
+.tab-count {
+  font-size: 10.5px;
+  font-weight: 700;
+  background: var(--accent);
+  color: var(--accent-text);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 16px;
+}
+
+/* --- Knowledge view (components/KnowledgeView.jsx) -------------------- */
+.kn-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+.kn-toolbar-end { display: flex; gap: 8px; margin-left: auto; }
+.kn-search, .kn-select {
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 9px;
+}
+.kn-search { flex: 1 1 260px; max-width: 420px; }
+.kn-select { max-width: 280px; }
+.kn-search:focus, .kn-select:focus { outline: none; border-color: var(--muted-2); }
+.kn-hint { color: var(--muted); font-size: 11.5px; margin: 0 0 16px; }
+.kn-notice { margin: 0 0 12px; }
+.kn-list { display: flex; flex-direction: column; gap: 12px; }
+.kn-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.kn-card-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.kn-title { display: flex; flex-direction: column; min-width: 0; }
+.kn-heading { font-weight: 600; font-size: 12.5px; overflow-wrap: anywhere; }
+.kn-id {
+  color: var(--muted-2);
+  font-size: 10.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+.kn-badges { display: flex; gap: 6px; flex-shrink: 0; align-items: flex-start; }
+.kn-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.kn-badge.edited { color: var(--text); border-color: var(--muted-2); }
+.kn-meta, .kn-meta-edit {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.kn-meta {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  background: var(--line-soft);
+  border-radius: 6px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.kn-editor { display: flex; flex-direction: column; }
+.kn-label { font-size: 11px; font-weight: 600; margin: 8px 0 4px; }
+.kn-label span { color: var(--muted); font-weight: 400; margin-left: 6px; }
+.kn-content { min-height: 14em; resize: vertical; }
+.kn-meta-edit { min-height: 8em; resize: vertical; }
+.kn-actions { display: flex; gap: 12px; align-items: center; margin-top: 10px; }
+button.link.danger:hover { color: var(--danger); }
+button:disabled { opacity: .45; cursor: default; }
+
+@media (max-width: 860px) {
+  .kn-toolbar-end { margin-left: 0; }
+  .kn-search, .kn-select { max-width: none; flex: 1 1 100%; }
 }

@@ -6,11 +6,20 @@
     cat email.txt | python -m rag ask
     python -m rag check                     # extraction stats before ingesting
     python -m rag manifest docs.xlsx        # sheet vs disk
+    python -m rag knowledge pull            # copy the live collection into the table
+    python -m rag knowledge export > chunks.json
+    python -m rag knowledge import chunks.json   # apply edits, re-embed, update Chroma
+
+Inside the stack, run these in the API container so they reach the same Chroma
+and database the live service uses:
+    docker exec -i email-classifier-api python -m rag knowledge export > chunks.json
+    docker exec -i email-classifier-api python -m rag knowledge import - < chunks.json
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import sys
 
@@ -116,6 +125,42 @@ def _manifest(args: argparse.Namespace) -> int:
     return 0 if result.complete else 2
 
 
+def _knowledge(args: argparse.Namespace) -> int:
+    from . import knowledge
+
+    if args.action == "pull":
+        n = knowledge.pull_from_chroma()
+        print(f"{n} chunks copied from collection {COLLECTION!r} into knowledge_chunks")
+        return 0
+
+    if args.action == "export":
+        data = json.dumps(knowledge.export_chunks(), ensure_ascii=False, indent=2)
+        if args.file and args.file != "-":
+            pathlib.Path(args.file).write_text(data + "\n")
+            print(f"wrote {args.file}", file=sys.stderr)
+        else:
+            print(data)
+        return 0
+
+    # import
+    if not args.file:
+        print("import needs a file (or - for stdin)", file=sys.stderr)
+        return 1
+    raw = sys.stdin.read() if args.file == "-" else pathlib.Path(args.file).read_text()
+    try:
+        result = knowledge.import_chunks(json.loads(raw))
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"nothing imported: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"{len(result['updated'])} updated, {len(result['created'])} created, "
+        f"{len(result['unchanged'])} unchanged"
+    )
+    for chunk_id in result["updated"] + result["created"]:
+        print(f"  {chunk_id}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="rag", description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -150,6 +195,15 @@ def main() -> int:
     p_man.add_argument("--column", help="column holding document names")
     p_man.add_argument("--sheet", help="worksheet name (default: the first)")
     p_man.set_defaults(func=_manifest)
+
+    p_kn = sub.add_parser(
+        "knowledge", help="the editable knowledge_chunks table (pull/export/import)"
+    )
+    p_kn.add_argument("action", choices=["pull", "export", "import"])
+    p_kn.add_argument(
+        "file", nargs="?", help="export: output file (default stdout); import: input file or -"
+    )
+    p_kn.set_defaults(func=_knowledge)
 
     args = ap.parse_args()
     return args.func(args)

@@ -56,7 +56,7 @@
       "parameters": {
         "operation": "completion",
         "completionTitle": "=Detected type: {{ $json.type }}",
-        "completionMessage": "={{ $json.reply ? (\"Subject: \" + $json.subject + \"\\n\\n\" + $json.reply) : \"No auto-reply was generated.\" }}\n\n———\nType: {{ $json.type }}   Route: {{ $json.route }}\nacademic {{ $json.probs ? $json.probs.academic : \"n/a\" }} · administrative {{ $json.probs ? $json.probs.administrative : \"n/a\" }} · spam {{ $json.probs ? $json.probs.spam : \"n/a\" }}\n{{ $json.answered ? \"Answered from: \" + $json.sources.join(\" | \") : \"(not auto-answered — \" + $json.reason + \"; goes to the human queue)\" }}",
+        "completionMessage": "={{ $json.reply ? (\"Subject: \" + $json.subject + \"\\n\\n\" + $json.reply) : \"No auto-reply was generated.\" }}\n\n———\nType: {{ $json.type }}   Route: {{ $json.route }}\nacademic {{ $json.probs ? $json.probs.academic : \"n/a\" }} · non-academic {{ $json.probs ? $json.probs.non_academic : \"n/a\" }}\n{{ $json.answered ? \"Answered from: \" + $json.sources.join(\" | \") : \"(not auto-answered — \" + $json.reason + \"; goes to the human queue)\" }}",
         "options": {}
       },
       "id": "form-result",

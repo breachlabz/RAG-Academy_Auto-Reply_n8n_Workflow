@@ -1,8 +1,10 @@
 """Multi-label intent detection with calibrated confidence.
 
-Only email that is unambiguously academic-only reaches the RAG auto-reply
-pipeline. Anything touching payments or records, anything the model is unsure
-about, and anything that fails to classify at all goes to a human.
+Two labels: `academic` and `non_academic`. Only email that is unambiguously
+academic-only reaches the RAG auto-reply pipeline. Everything else -- payments,
+records, account issues, unrelated mail and spam, all of which are
+`non_academic` -- plus anything the model is unsure about and anything that
+fails to classify at all goes to a human.
 """
 
 from __future__ import annotations
@@ -52,20 +54,23 @@ def auth_headers() -> dict[str, str]:
 
 DEFAULT_THRESHOLD = float(os.environ.get("EC_THRESHOLD", "0.9"))
 # Separately configurable, but defaults to the same bar as academic: the
-# `administrative` boolean flag on its own is effectively a bare >50% vote
+# `non_academic` boolean flag on its own is effectively a bare >50% vote
 # (the model's greedy decode of its own schema), which is enough to override
-# a 99%+ confident `academic` on a coin flip. A genuinely administrative email
-# (an invoice question, a login problem) clears this by a wide margin; this
-# threshold exists for the mixed-intent email sitting right on the boundary,
-# so it no longer loses an academic answer it could have had to a 53% guess.
-ADMIN_THRESHOLD = float(os.environ.get("EC_ADMIN_THRESHOLD", DEFAULT_THRESHOLD))
+# a 99%+ confident `academic` on a coin flip. A genuinely non-academic email
+# (an invoice question, a login problem, a marketing blast) clears this by a
+# wide margin; this threshold exists for the mixed-intent email sitting right
+# on the boundary, so it no longer loses an academic answer it could have had
+# to a 53% guess.
+NON_ACADEMIC_THRESHOLD = float(
+    os.environ.get("EC_NON_ACADEMIC_THRESHOLD", DEFAULT_THRESHOLD)
+)
 
 # Calibrated confidence needs token logprobs on /chat/completions. LiteLLM (over
 # llama.cpp or vLLM) returns them; Ollama's OpenAI endpoint did not until ~v0.12.
 # Without them the default is to treat every email as unclassified, which sends
 # the whole mailbox to the human queue. EC_ALLOW_UNCALIBRATED=1 instead lets the
-# model's bare true/false decode stand: the gate still fails safe (any positive
-# spam/administrative flag routes to a human), but the probability thresholds no
+# model's bare true/false decode stand: the gate still fails safe (a positive
+# non_academic flag routes to a human), but the probability thresholds no
 # longer bite, so a borderline mixed-intent email is settled by one boolean
 # rather than held. Leave it off for a logprob-capable backend.
 ALLOW_UNCALIBRATED = os.environ.get("EC_ALLOW_UNCALIBRATED", "").lower() in (
@@ -82,7 +87,7 @@ ALLOW_UNCALIBRATED = os.environ.get("EC_ALLOW_UNCALIBRATED", "").lower() in (
 # should not see it.
 NUM_CTX = os.environ.get("EC_NUM_CTX")
 
-LABELS = ("academic", "administrative", "spam")
+LABELS = ("academic", "non_academic")
 
 # The key order and wording here must stay in sync with SCHEMA below. When the
 # prompt does not describe the schema, grammar-constrained decoding forces
@@ -95,13 +100,15 @@ Output a JSON object with exactly these keys, in this order:
               certification, syllabus, schedules, exam dates, or the
               price/fees of a course a prospective student is
               considering.
-  "administrative": true if the email concerns an existing invoice,
-              payment status, refund, enrollment record, or account
-              issue tied to a specific enrolled student. A general
-              question about what a course costs is NOT administrative
-              on its own -- only billing/refund/status action on an
-              existing enrollment is.
-  "spam": true if the email is unrelated to the institute.
+  "non_academic": true if the email contains anything other than an
+              academic question: an existing invoice, payment status,
+              refund, enrollment record, or account issue tied to a
+              specific enrolled student; or anything unrelated to the
+              institute (marketing, phishing, vendor outreach,
+              newsletters, misdirected mail). A general question about
+              what a course costs is NOT non_academic on its own --
+              only billing/refund/status action on an existing
+              enrollment is.
 
 An email may set more than one flag. Set every flag independently."""
 
@@ -115,14 +122,14 @@ SCHEMA = {
 # Appended to SYSTEM when the caller supplies earlier messages.
 #
 # A follow-up email carries almost none of its own subject matter. "And what
-# does the second one cover?" was measured at academic 0.2195 / spam 0.7835 --
-# routed to a human as spam -- because on its own it is a bag of stopwords with
-# no institute in sight. Every threaded conversation therefore died at the gate
+# does the second one cover?" was measured at academic 0.2195 / spam 0.7835
+# under the old three-label schema -- routed to a human as spam -- because on
+# its own it is a bag of stopwords with no institute in sight. Every threaded conversation therefore died at the gate
 # on its second message, which is the exact case threading exists to serve.
 #
 # The rules below are what stop the fix from becoming a hole. The thread is for
 # resolving what the latest email refers to, not for inheriting its label: a
-# payment question asked inside an academic thread is still administrative and
+# payment question asked inside an academic thread is still non_academic and
 # still belongs to a human. Classifying the *thread* rather than the *email*
 # would auto-answer it.
 CONTEXT_SYSTEM = """
@@ -134,7 +141,7 @@ You are shown the earlier messages of the conversation before the latest email.
   be understood as asking about whatever it follows up on.
 - Do not inherit the labels of the earlier messages. A follow-up about an
   existing invoice, payment status, refund, or enrollment record is
-  administrative even when every message before it was academic. A follow-up
+  non_academic even when every message before it was academic. A follow-up
   merely asking what a course costs stays academic."""
 
 
@@ -272,17 +279,13 @@ def classify(
 def route(result: Result, threshold: float = DEFAULT_THRESHOLD) -> str:
     """Return "rag" or "human". Every uncertain path resolves to "human".
 
-    `administrative` is checked against ADMIN_THRESHOLD, not the raw boolean
-    flag -- see the comment on ADMIN_THRESHOLD for why a bare flag has no
-    margin. `spam` keeps the boolean: it has no counterpart pulling the other
-    way (nothing wants a spam email routed to rag), so there is nothing for a
-    margin to protect against.
+    `non_academic` is checked against NON_ACADEMIC_THRESHOLD, not the raw
+    boolean flag -- see the comment on NON_ACADEMIC_THRESHOLD for why a bare
+    flag has no margin.
     """
     if not result.ok:
         return "human"
-    if result.flags.get("spam"):
-        return "human"
-    if result.probs.get("administrative", 0.0) >= ADMIN_THRESHOLD:
+    if result.probs.get("non_academic", 0.0) >= NON_ACADEMIC_THRESHOLD:
         return "human"
     if not result.flags.get("academic"):
         return "human"

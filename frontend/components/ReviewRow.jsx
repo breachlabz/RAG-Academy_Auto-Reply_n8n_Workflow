@@ -35,6 +35,29 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
 
+  // Drag bar under the edit box: height only, and never below the CSS
+  // min-height (the default size), so dragging up just stops there.
+  function startResize(e) {
+    const el = textareaRef.current;
+    if (!el) return;
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = el.offsetHeight;
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+    const onMove = (ev) => {
+      el.style.height = startHeight + (ev.clientY - startY) + "px";
+    };
+    const onUp = () => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onUp);
+      handle.removeEventListener("pointercancel", onUp);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onUp);
+    handle.addEventListener("pointercancel", onUp);
+  }
+
   // One file only. Read fully into memory here, in state -- never sent
   // anywhere until Send is clicked, and never persisted client-side either
   // (no localStorage): see lib/attachment.js.
@@ -107,7 +130,7 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
       </div>
 
       <div className="col">
-        {row.is_followup && <div className="followup-badge">Follow-up · no reply expected</div>}
+        {!!row.is_followup && <div className="followup-badge">Follow-up · no reply expected</div>}
         <ClampedText text={row.query || ""} />
         {row.query_gist && (
           <div className="gist"><span className="gist-label">Summary:</span> {row.query_gist}</div>
@@ -149,6 +172,14 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
           className="edit-box"
           value={text}
           onChange={(e) => setText(e.target.value)}
+        />
+        <div
+          className="edit-resize"
+          title="Drag to resize"
+          onPointerDown={startResize}
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize edit box"
         />
         <div className="attachment-row">
           <input

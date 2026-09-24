@@ -53,7 +53,7 @@ from rag.core import (  # noqa: E402
     is_near_duplicate,
     refuses_in_prose,
 )
-from classifier.core import Result  # noqa: E402
+from classifier.core import LABELS, Result, classify, route  # noqa: E402
 from rag.core import NO_INFO_REPLY  # noqa: E402
 from rag.format_hint import as_bullets, resolve, wants_list  # noqa: E402
 from threads import context as thread_context  # noqa: E402
@@ -83,6 +83,87 @@ def _network_reachable() -> bool:
 
 
 _NETWORK_OK = _network_reachable()
+
+
+# =============================================================================
+# classifier.core.route() / classify() and api.primary_type() -- the two-label
+# schema (academic / non_academic) that replaced academic / administrative /
+# spam. Routing is unchanged: only a confident academic-only email reaches rag.
+# =============================================================================
+
+
+def _result(academic: float, non_academic: float) -> Result:
+    return Result(
+        flags={"academic": academic >= 0.5, "non_academic": non_academic >= 0.5},
+        probs={"academic": academic, "non_academic": non_academic},
+    )
+
+
+class TestTwoLabelRouting(unittest.TestCase):
+    def test_labels_are_academic_and_non_academic(self):
+        self.assertEqual(LABELS, ("academic", "non_academic"))
+
+    def test_confident_academic_only_goes_to_rag(self):
+        self.assertEqual(route(_result(0.97, 0.02)), "rag")
+
+    def test_non_academic_goes_to_human(self):
+        self.assertEqual(route(_result(0.01, 0.99)), "human")
+
+    def test_mixed_academic_and_non_academic_goes_to_human(self):
+        """A course question with a payment issue buried in it must never be
+        auto-answered, however sure the model is about the academic part."""
+        self.assertEqual(route(_result(0.99, 0.95)), "human")
+
+    def test_low_confidence_academic_goes_to_human(self):
+        self.assertEqual(route(_result(0.7, 0.05)), "human")
+
+    def test_borderline_non_academic_flag_does_not_block_rag(self):
+        """A bare >50% non_academic flag is below NON_ACADEMIC_THRESHOLD and
+        does not override a confident academic."""
+        self.assertEqual(route(_result(0.99, 0.55)), "rag")
+
+    def test_error_goes_to_human(self):
+        self.assertEqual(route(Result(error="boom")), "human")
+
+    def test_classify_maps_logprobs_to_both_labels_in_order(self):
+        tok = lambda t, p_true: {  # noqa: E731
+            "token": t,
+            "logprob": 0.0,
+            "top_logprobs": [{"token": "true", "logprob": __import__("math").log(p_true)}],
+        }
+        payload = {
+            "choices": [{
+                "message": {"content": '{"academic": true, "non_academic": false}'},
+                "logprobs": {"content": [tok("true", 0.96), tok("false", 0.03)]},
+            }]
+        }
+        with mock.patch("classifier.core.requests.post", return_value=_mock_response(payload)):
+            result = classify("When is the Level 2 exam?")
+        self.assertTrue(result.ok)
+        self.assertAlmostEqual(result.probs["academic"], 0.96)
+        self.assertAlmostEqual(result.probs["non_academic"], 0.03)
+        self.assertEqual(route(result), "rag")
+
+
+class TestPrimaryType(unittest.TestCase):
+    def setUp(self):
+        try:
+            from api import primary_type
+        except Exception as exc:  # pragma: no cover - environment-dependent
+            raise unittest.SkipTest(f"api.py not importable here: {exc}")
+        self.primary_type = primary_type
+
+    def test_academic_only_is_academic(self):
+        self.assertEqual(self.primary_type({"academic": True, "non_academic": False}), "academic")
+
+    def test_everything_else_is_non_academic(self):
+        for flags in (
+            {"academic": False, "non_academic": True},
+            {"academic": True, "non_academic": True},
+            {"academic": False, "non_academic": False},
+        ):
+            with self.subTest(flags=flags):
+                self.assertEqual(self.primary_type(flags), "non_academic")
 
 
 # =============================================================================
@@ -989,12 +1070,12 @@ class TestReplyHtml(unittest.TestCase):
 # =============================================================================
 
 _RAG_ROUTE_RESULT = Result(
-    flags={"academic": True, "administrative": False, "spam": False},
-    probs={"academic": 0.95, "administrative": 0.0, "spam": 0.0},
+    flags={"academic": True, "non_academic": False},
+    probs={"academic": 0.95, "non_academic": 0.0},
 )
 _HUMAN_ROUTE_RESULT = Result(
-    flags={"academic": True, "administrative": True, "spam": False},
-    probs={"academic": 0.95, "administrative": 0.95, "spam": 0.0},
+    flags={"academic": True, "non_academic": True},
+    probs={"academic": 0.95, "non_academic": 0.95},
 )
 
 
@@ -1120,6 +1201,142 @@ class GenerateReplyFlowTestCase(unittest.TestCase):
         self.assertFalse(exchanges[0].grounded)
         self.assertIn(NO_INFO_REPLY, exchanges[0].reply)
 
+
+
+# =============================================================================
+# rag.knowledge -- the editable knowledge_chunks table. Temp sqlite file per
+# test; the Chroma side (_push/_drop) is mocked, so these check the table
+# logic and that every write is pushed before it is saved.
+# =============================================================================
+
+
+class TestKnowledgeStore(unittest.TestCase):
+    def setUp(self):
+        from rag import knowledge
+
+        self.kn = knowledge
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self.db = pathlib.Path(self._tmp.name)
+        self.push = mock.patch.object(knowledge, "_push").start()
+        self.drop = mock.patch.object(knowledge, "_drop").start()
+        self.addCleanup(mock.patch.stopall)
+        self.addCleanup(self.db.unlink)
+        knowledge.record_ingest(
+            [
+                ("a.docx#0", "A > Intro\n\nfirst", {"source": "a.docx", "heading": "A > Intro", "chunk_index": 0}),
+                ("a.docx#1", "A > Fees\n\nsecond", {"source": "a.docx", "heading": "A > Fees", "chunk_index": 1}),
+                ("b.docx#0", "B\n\nthird", {"source": "b.docx", "heading": "B", "chunk_index": 0}),
+            ],
+            path=self.db,
+        )
+
+    def test_ingest_rows_are_listed_with_json_metadata(self):
+        rows = self.kn.list_chunks(path=self.db)
+        self.assertEqual([r["id"] for r in rows], ["a.docx#0", "a.docx#1", "b.docx#0"])
+        self.assertEqual(rows[1]["metadata"], {"source": "a.docx", "heading": "A > Fees", "chunk_index": 1})
+        self.assertFalse(rows[0]["edited"])
+        self.assertEqual(rows[0]["origin"], "ingest")
+
+    def test_filter_by_source_and_query(self):
+        self.assertEqual(len(self.kn.list_chunks(source="a.docx", path=self.db)), 2)
+        self.assertEqual([r["id"] for r in self.kn.list_chunks(q="FEES", path=self.db)], ["a.docx#1"])
+
+    def test_update_pushes_to_chroma_then_marks_edited(self):
+        out = self.kn.update_chunk("a.docx#1", content="A > Fees\n\nnew text", path=self.db)
+        self.push.assert_called_once()
+        (pushed,), _ = self.push.call_args
+        self.assertEqual(pushed[0][:2], ("a.docx#1", "A > Fees\n\nnew text"))
+        self.assertTrue(out["edited"])
+        self.assertEqual(out["content"], "A > Fees\n\nnew text")
+
+    def test_failed_push_leaves_row_unchanged(self):
+        self.push.side_effect = RuntimeError("embedder down")
+        with self.assertRaises(RuntimeError):
+            self.kn.update_chunk("a.docx#0", content="changed", path=self.db)
+        row = self.kn.get_chunk("a.docx#0", path=self.db)
+        self.assertEqual(row["content"], "A > Intro\n\nfirst")
+        self.assertFalse(row["edited"])
+
+    def test_unchanged_update_does_not_re_embed(self):
+        self.kn.update_chunk("a.docx#0", content="A > Intro\n\nfirst", path=self.db)
+        self.push.assert_not_called()
+
+    def test_metadata_must_be_flat_and_keep_source_heading(self):
+        for bad in (
+            {"source": "a.docx", "heading": "x", "tags": ["a"]},
+            {"source": "a.docx", "heading": "x", "nested": {"k": 1}},
+            {"source": "a.docx", "heading": "x", "n": None},
+            {"heading": "x"},
+            ["not", "an", "object"],
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.kn.update_chunk("a.docx#0", metadata=bad, path=self.db)
+        self.push.assert_not_called()
+        ok = self.kn.update_chunk(
+            "a.docx#0",
+            metadata={"source": "a.docx", "heading": "A > Intro", "chunk_index": 0, "priority": 2, "verified": True},
+            path=self.db,
+        )
+        self.assertEqual(ok["metadata"]["priority"], 2)
+
+    def test_unknown_id_is_keyerror(self):
+        with self.assertRaises(KeyError):
+            self.kn.update_chunk("nope#0", content="x", path=self.db)
+        with self.assertRaises(KeyError):
+            self.kn.delete_chunk("nope#0", path=self.db)
+
+    def test_create_manual_chunk_fills_source_and_heading(self):
+        out = self.kn.create_chunk("Office hours are 9-5.", {"heading": "Office hours"}, path=self.db)
+        self.assertTrue(out["id"].startswith("manual:"))
+        self.assertEqual(out["origin"], "manual")
+        self.assertEqual(out["metadata"], {"source": "manual", "heading": "Office hours"})
+        self.push.assert_called_once()
+
+    def test_delete_drops_from_chroma_and_table(self):
+        self.kn.delete_chunk("b.docx#0", path=self.db)
+        self.drop.assert_called_once_with(["b.docx#0"])
+        self.assertIsNone(self.kn.get_chunk("b.docx#0", path=self.db))
+
+    def test_reingest_overwrites_edits_docx_wins(self):
+        self.kn.update_chunk("a.docx#0", content="hand edit", path=self.db)
+        self.kn.record_ingest(
+            [("a.docx#0", "A > Intro\n\nfirst", {"source": "a.docx", "heading": "A > Intro", "chunk_index": 0})],
+            path=self.db,
+        )
+        row = self.kn.get_chunk("a.docx#0", path=self.db)
+        self.assertEqual(row["content"], "A > Intro\n\nfirst")
+        self.assertFalse(row["edited"])
+
+    def test_stale_ids_only_for_reingested_sources(self):
+        stale = self.kn.stale_ingest_ids(["a.docx"], {"a.docx#0"}, path=self.db)
+        self.assertEqual(stale, ["a.docx#1"])
+
+    def test_reset_ingest_keeps_manual_chunks(self):
+        manual = self.kn.create_chunk("keep me", {"heading": "Manual"}, path=self.db)
+        self.kn.record_ingest([], reset=True, path=self.db)
+        ids = [r["id"] for r in self.kn.list_chunks(path=self.db)]
+        self.assertEqual(ids, [manual["id"]])
+
+    def test_import_updates_creates_and_skips_unchanged(self):
+        rows = self.kn.export_chunks(path=self.db)
+        rows[0]["content"] = "edited via file"
+        rows.append({"content": "brand new", "metadata": {"heading": "New"}})
+        result = self.kn.import_chunks(rows, path=self.db)
+        self.assertEqual(result["updated"], ["a.docx#0"])
+        self.assertEqual(len(result["created"]), 1)
+        self.assertEqual(sorted(result["unchanged"]), ["a.docx#1", "b.docx#0"])
+        self.push.assert_called_once()
+        self.assertEqual(len(self.push.call_args[0][0]), 2)
+
+    def test_import_validates_everything_before_writing(self):
+        rows = self.kn.export_chunks(path=self.db)
+        rows[0]["content"] = "would change"
+        rows[1]["metadata"] = {"source": "a.docx", "heading": "x", "bad": [1]}
+        with self.assertRaises(ValueError):
+            self.kn.import_chunks(rows, path=self.db)
+        self.push.assert_not_called()
+        self.assertEqual(self.kn.get_chunk("a.docx#0", path=self.db)["content"], "A > Intro\n\nfirst")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -29,31 +29,33 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from classifier.core import BASE_URL, LARGE_MODEL, auth_headers  # noqa: E402
 
 # Gold labels are assigned by which spec produced the email, so the generator
-# never has to self-report a label it might get wrong.
+# never has to self-report a label it might get wrong. The specs stay split by
+# kind of non-academic mail (administrative vs spam) so the set covers both,
+# but both carry the same `non_academic` gold label.
 SPECS = {
     "academic_only": (
         "asks only about course content, curriculum, certification, syllabus, "
         "class schedules, or exam dates. It must not mention money, invoices, "
         "enrollment status, or personal records.",
-        {"academic": True, "administrative": False, "spam": False},
+        {"academic": True, "non_academic": False},
     ),
     "administrative_only": (
         "concerns only payment, invoicing, refunds, enrollment status, or "
         "personal records. It must not ask anything about course content or "
         "schedules.",
-        {"academic": False, "administrative": True, "spam": False},
+        {"academic": False, "non_academic": True},
     ),
     "mixed": (
         "asks about course content or schedules AND separately raises a "
         "payment, invoice, refund, or enrollment-status issue. Bury the "
         "administrative part mid-paragraph or at the very end so it is easy "
         "to miss.",
-        {"academic": True, "administrative": True, "spam": False},
+        {"academic": True, "non_academic": True},
     ),
     "spam": (
         "is unrelated to the institute: marketing blasts, phishing, cold "
         "vendor outreach, newsletters, or misdirected mail.",
-        {"academic": False, "administrative": False, "spam": True},
+        {"academic": False, "non_academic": True},
     ),
 }
 

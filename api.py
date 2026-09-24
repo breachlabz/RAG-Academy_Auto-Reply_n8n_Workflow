@@ -2,7 +2,7 @@
 
 n8n cannot import the Python module, so it talks to this over HTTP instead.
 
-    POST /classify        {"text": "..."}        -> {"type": "administrative", ...}
+    POST /classify        {"text": "..."}        -> {"type": "non_academic", ...}
     POST /answer          {"text": "..."}        -> the above, plus a grounded reply
     POST /generate-reply  {"email_text": ..., "conversation_id": ...}
                                                  -> the above, thread-aware
@@ -15,6 +15,9 @@ n8n cannot import the Python module, so it talks to this over HTTP instead.
     GET  /review/queue    grounded replies awaiting review, as JSON
     GET  /review/history  already-sent replies, most recent first, as JSON
     POST /review/{id}/send  {"reply": "..."}  -> send it (Graph) and record it
+    GET  /knowledge       editable knowledge chunks (content + JSON metadata)
+    POST /knowledge       {"content": ..., "metadata": {...}} -> add a chunk
+    GET|PUT|DELETE /knowledge/{id}  one chunk; writes re-embed and update Chroma
     GET  /health
 
 /emails/prepare and /emails/finalize are /generate-reply split in two, for the
@@ -39,8 +42,8 @@ loads the thread, rewrites follow-up questions before retrieval, and stores the
 draft it produced.
 
 Both keep the classifier gate *inside* the endpoint rather than exposing
-retrieval on its own, so no caller can reach the RAG path around the gate. An
-administrative email must not get an auto-reply just because the caller hit the
+retrieval on its own, so no caller can reach the RAG path around the gate. A
+non-academic email must not get an auto-reply just because the caller hit the
 answering endpoint.
 
 Run locally:  uvicorn api:app --port 8100
@@ -67,6 +70,8 @@ from rag import answer as rag_answer
 from rag import answer_followup
 from rag import is_near_duplicate
 from rag import resolve_format
+from rag import knowledge as rag_knowledge
+from rag.core import COLLECTION as RAG_COLLECTION
 from rag.core import EMAIL_SUBJECT, format_email, ground
 from rag.format_hint import as_bullets, wants_list
 from threads import context as thread_context
@@ -91,17 +96,15 @@ app.mount(
     name="review-assets",
 )
 
-# "Detect the type" wants one label, but the classifier returns three
-# independent flags. Collapse by priority: a payment issue outranks a course
-# question (it must never be auto-answered), and spam outranks everything.
-PRIORITY = ("spam", "administrative", "academic")
-
-
+# "Detect the type" wants one label, but the classifier returns two
+# independent flags. An email is `academic` only when it is academic and
+# nothing else; everything else -- a payment issue riding along with a course
+# question (which must never be auto-answered), spam, or an email the model set
+# no flag on at all -- is `non_academic`.
 def primary_type(flags: dict[str, bool]) -> str:
-    for label in PRIORITY:
-        if flags.get(label):
-            return label
-    return "none"  # model set no flag -- a general inquiry we can't place
+    if flags.get("academic") and not flags.get("non_academic"):
+        return "academic"
+    return "non_academic"
 
 
 class ClassifyRequest(BaseModel):
@@ -233,7 +236,7 @@ def _classified(
 
     `context` is the thread so far. It only ever affects what the model is shown
     -- the label still describes `text` alone, and the gate is unchanged: an
-    administrative follow-up in an academic thread still routes to a human.
+    non-academic follow-up in an academic thread still routes to a human.
     """
     result = classify(text, context=context)
     if not result.ok:
@@ -274,8 +277,8 @@ def answer_email(req: ClassifyRequest) -> dict:
     """Classify, then answer from the documents only if the gate allows it.
 
     This runs the whole pipeline rather than exposing retrieval on its own, so
-    a caller cannot reach the RAG path around the classifier -- an
-    administrative email must not get an auto-reply just because the caller hit
+    a caller cannot reach the RAG path around the classifier -- a
+    non-academic email must not get an auto-reply just because the caller hit
     the answering endpoint. It also keeps the n8n workflow to a single HTTP
     node, which matters given how quietly that workflow fails.
 
@@ -299,10 +302,11 @@ def answer_email(req: ClassifyRequest) -> dict:
     }
 
     if payload["route"] != "rag":
-        # No `reply`/`subject` here on purpose. This branch is payments, records
-        # and spam -- "we don't have relevant information related to this query"
-        # is both untrue and unhelpful for an unpaid-invoice email, which is not
-        # unanswerable, just not ours to answer automatically.
+        # No `reply`/`subject` here on purpose. This branch is non-academic
+        # mail (payments, records, spam) -- "we don't have relevant information
+        # related to this query" is both untrue and unhelpful for an
+        # unpaid-invoice email, which is not unanswerable, just not ours to
+        # answer automatically.
         payload["reason"] = "not routed to rag"
         return payload
 
@@ -380,8 +384,9 @@ def generate_reply(req: ReplyRequest) -> dict:
 
     # Classified against `block`, the thread up to but not including this email.
     # Without it a follow-up is judged on its own words, and "and what does the
-    # second one cover?" measures academic 0.22 / spam 0.78 -- so the gate sent
-    # every second message of every conversation to a human.
+    # second one cover?" measured academic 0.22 / spam 0.78 under the old
+    # three-label schema -- so the gate sent every second message of every
+    # conversation to a human.
     payload = _classified(email_text, req.threshold, block)
     payload |= {
         "conversation_id": key,
@@ -410,7 +415,7 @@ def generate_reply(req: ReplyRequest) -> dict:
         return payload
 
     if payload["route"] != "rag":
-        # Payments, records and spam. No draft: "we don't have relevant
+        # Non-academic: payments, records, spam. No draft: "we don't have relevant
         # information" is untrue and unhelpful for an unpaid-invoice email,
         # which is not unanswerable, just not ours to answer automatically.
         payload["reason"] = "not routed to rag"
@@ -526,7 +531,7 @@ def prepare_email(req: PrepareRequest) -> dict:
 
     # Classified against `block` -- the thread before this email -- so a
     # follow-up is not judged on its own words alone. The gate is unchanged:
-    # spam or an administrative follow-up still routes to a human.
+    # a non-academic follow-up still routes to a human.
     payload = _classified(email_text, req.threshold, block)
     gate = payload.get("route") == "rag"
 
@@ -906,3 +911,78 @@ def review_send(exchange_id: int, req: SendReplyRequest) -> dict:
         "sent_via_graph": not REVIEW_DRY_RUN,
         "dry_run": REVIEW_DRY_RUN,
     }
+
+
+# --- Knowledge base -----------------------------------------------------
+#
+# The editable copy of what retrieval searches: one row per Chroma chunk in
+# `knowledge_chunks` (rag/knowledge.py), with its metadata as JSON. Every
+# write re-embeds the chunk and updates the collection before the row is
+# saved, so an edit here changes what both reply paths retrieve. Same trust
+# boundary as /review: localhost only, no login of its own.
+#
+# Chunk ids contain "#" (e.g. "EVH_Level_3_2.4.docx#3"), so callers must
+# URL-encode them (%23) -- the `:path` converter keeps any "/" intact too.
+
+
+class KnowledgeUpdateRequest(BaseModel):
+    """PUT /knowledge/{id}. Either field may be omitted; `metadata`, when
+    sent, replaces the whole object rather than patching it."""
+
+    content: str | None = None
+    metadata: dict | None = None
+
+
+class KnowledgeCreateRequest(BaseModel):
+    content: str
+    metadata: dict = {}
+    id: str | None = None
+
+
+def _knowledge_call(fn, *args, **kwargs):
+    """Map rag.knowledge's exceptions onto HTTP statuses."""
+    try:
+        return fn(*args, **kwargs)
+    except KeyError as exc:
+        raise HTTPException(404, "no such chunk") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:  # embedder or Chroma unreachable/rejected
+        raise HTTPException(502, f"could not update the vector store: {exc}") from exc
+
+
+@app.get("/knowledge")
+def knowledge_list(q: str = "", source: str = "") -> dict:
+    chunks = rag_knowledge.list_chunks(q=q, source=source)
+    sources = sorted(
+        {str(c["metadata"].get("source", "")) for c in rag_knowledge.list_chunks()}
+    )
+    return {"chunks": chunks, "sources": sources, "collection": RAG_COLLECTION}
+
+
+@app.post("/knowledge")
+def knowledge_create(req: KnowledgeCreateRequest) -> dict:
+    return _knowledge_call(
+        rag_knowledge.create_chunk, req.content, req.metadata, chunk_id=req.id or None
+    )
+
+
+@app.get("/knowledge/{chunk_id:path}")
+def knowledge_get(chunk_id: str) -> dict:
+    chunk = rag_knowledge.get_chunk(chunk_id)
+    if chunk is None:
+        raise HTTPException(404, "no such chunk")
+    return chunk
+
+
+@app.put("/knowledge/{chunk_id:path}")
+def knowledge_update(chunk_id: str, req: KnowledgeUpdateRequest) -> dict:
+    return _knowledge_call(
+        rag_knowledge.update_chunk, chunk_id, content=req.content, metadata=req.metadata
+    )
+
+
+@app.delete("/knowledge/{chunk_id:path}")
+def knowledge_delete(chunk_id: str) -> dict:
+    _knowledge_call(rag_knowledge.delete_chunk, chunk_id)
+    return {"ok": True, "id": chunk_id}

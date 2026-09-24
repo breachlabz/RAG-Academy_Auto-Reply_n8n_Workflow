@@ -22,9 +22,21 @@ from classifier.core import LABELS, LARGE_MODEL, classify, route  # noqa: E402
 THRESHOLDS = [0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99]
 
 
+def normalize_gold(gold: dict) -> dict:
+    """Gold labels in the current two-label schema. Holdout files generated
+    before `administrative` and `spam` were merged into `non_academic` still
+    carry the old keys; either of them set means non_academic."""
+    if "non_academic" in gold:
+        return gold
+    return {
+        "academic": gold["academic"],
+        "non_academic": bool(gold.get("administrative") or gold.get("spam")),
+    }
+
+
 def is_rag_eligible(gold: dict) -> bool:
     """Gold-truth answer to "should this have been auto-replied?"."""
-    return gold["academic"] and not gold["administrative"] and not gold["spam"]
+    return gold["academic"] and not gold["non_academic"]
 
 
 def main() -> int:
@@ -42,6 +54,8 @@ def main() -> int:
     args = ap.parse_args()
 
     rows = [json.loads(line) for line in args.holdout.read_text().splitlines() if line.strip()]
+    for row in rows:
+        row["gold"] = normalize_gold(row["gold"])
     if args.only:
         rows = [r for r in rows if r["spec"] == args.only]
         if not rows:
@@ -51,7 +65,7 @@ def main() -> int:
 
     if args.verbose:
         print(f"{'#':>3} {'':1} {'type':<20} {'decision':<8} {'acad':>5} "
-              f"{'admin':>6} {'spam':>5}  email")
+              f"{'non-ac':>6}  email")
 
     scored, errors = [], 0
     for i, row in enumerate(rows, 1):
@@ -66,8 +80,8 @@ def main() -> int:
             mark = "." if decision == expected else "X"
             probs = result.probs
             cells = (
-                f"{probs['academic']:>5.2f} {probs['administrative']:>6.2f} "
-                f"{probs['spam']:>5.2f}" if result.ok else f"{'--':>5} {'--':>6} {'--':>5}"
+                f"{probs['academic']:>5.2f} {probs['non_academic']:>6.2f}"
+                if result.ok else f"{'--':>5} {'--':>6}"
             )
             body = " ".join(row["body"].split())[:60]
             print(f"{i:>3} {mark} {row['spec']:<20} {decision:<8} {cells}  {body}")

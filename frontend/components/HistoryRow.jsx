@@ -41,7 +41,7 @@ export default function HistoryRow({ row }) {
       </div>
 
       <div className="col">
-        {row.is_followup && <div className="followup-badge">Follow-up · no reply expected</div>}
+        {!!row.is_followup && <div className="followup-badge">Follow-up · no reply expected</div>}
         <ClampedText text={row.query || ""} />
         {row.query_gist && (
           <div className="gist"><span className="gist-label">Summary:</span> {row.query_gist}</div>

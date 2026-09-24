@@ -569,10 +569,15 @@ def ingest(paths: list[pathlib.Path], *, reset: bool = False) -> int:
     """Chunk and store the given markdown/text files. Returns chunks written.
 
     Ids are derived from the file name and chunk index, so re-ingesting an
-    edited file overwrites its chunks instead of duplicating them. Sections
-    *deleted* from a file still leave their old chunks behind, though -- use
-    reset=True after removing content.
+    edited file overwrites its chunks instead of duplicating them. Every chunk
+    is mirrored into the editable `knowledge_chunks` table (rag.knowledge),
+    and the documents win: rows for an ingested file are overwritten, edits
+    included, and rows for sections the file no longer has are removed from
+    both the table and the collection. reset=True still drops the whole
+    collection first; manual chunks survive it and are re-embedded.
     """
+    from . import knowledge
+
     if reset:
         try:
             _client().delete_collection(COLLECTION)
@@ -604,6 +609,23 @@ def ingest(paths: list[pathlib.Path], *, reset: bool = False) -> int:
         documents=documents,
         metadatas=metadatas,
         embeddings=embed(documents),
+    )
+
+    removed = [] if reset else knowledge.stale_ingest_ids(
+        [path.name for path in paths], set(ids)
+    )
+    if removed:
+        collection.delete(ids=removed)
+    if reset:
+        # The dropped collection took the hand-written chunks with it.
+        manual = knowledge.manual_chunks()
+        if manual:
+            m_ids, m_docs, m_metas = map(list, zip(*manual))
+            collection.upsert(
+                ids=m_ids, documents=m_docs, metadatas=m_metas, embeddings=embed(m_docs)
+            )
+    knowledge.record_ingest(
+        list(zip(ids, documents, metadatas)), removed=removed, reset=reset
     )
     return len(ids)
 

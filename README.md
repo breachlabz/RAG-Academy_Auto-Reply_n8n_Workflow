@@ -2,7 +2,8 @@
 
 An assistant that watches an Outlook mailbox and, for each incoming email:
 
-1. **Classifies** it as *academic*, *administrative*, or *spam*.
+1. **Classifies** it as *academic* or *non-academic* (payments, records,
+   account issues, spam — anything that is not an academic question).
 2. For academic-only email, **retrieves** the relevant passages from a set of
    Word documents about the training programmes and **drafts a reply grounded
    in them** — nothing else.
@@ -179,6 +180,41 @@ Supported: `.docx .pdf .md .txt .html`. Check extraction first with
 a few hundred characters is a scan with no text layer and no setting will
 rescue it.
 
+### 4a. Tune the knowledge base (`knowledge_chunks`)
+
+Every chunk in the collection also has a row in the `knowledge_chunks` table
+in `data/threads.db`: the exact text that is embedded and shown to the model
+(`content`), and its metadata as a JSON object (`source`, `heading`,
+`chunk_index`, plus any keys you add). Editing a row re-embeds it and updates
+Chroma straight away, so the change reaches both reply paths (`/answer` /
+`/generate-reply` and the n8n agent's `academy_docs` tool) on the next email.
+
+- **In the browser:** the **Knowledge** tab on `/review` lets you search,
+  edit, add and delete chunks, and export them all as JSON.
+- **Over HTTP:** `GET/POST /knowledge`, `GET/PUT/DELETE /knowledge/{id}` (§10).
+- **As a file:**
+  ```sh
+  docker compose exec -T classifier python -m rag knowledge export > chunks.json
+  # edit chunks.json -- change content/metadata, or add {"content", "metadata"} entries
+  docker compose exec -T classifier python -m rag knowledge import - < chunks.json
+  ```
+  Import updates changed chunks, creates entries with no/unknown id as manual
+  chunks, and never deletes anything missing from the file. The whole file is
+  validated before anything is written.
+
+**The documents win.** `ingest` overwrites the rows of every file it loads —
+your edits to those chunks included — and removes rows for sections the file
+no longer has. Chunks added by hand (`origin: manual`) are never touched by
+ingest, and survive `--reset`. A change that must outlive the next re-ingest
+belongs in the `.docx`, or in a manual chunk.
+
+Metadata values must be flat (string, number or boolean) — that is all
+Chroma stores. `source` and `heading` are required; `heading` is what the
+review page shows as a reply's source.
+
+For a collection ingested before this table existed, fill the table once from
+what is live (no re-embedding): `docker compose exec classifier python -m rag knowledge pull`.
+
 ---
 
 ## 5. Chat model requirements
@@ -197,8 +233,8 @@ JSON to decide confidence. **No logprobs → classification fails for every emai
   ```ini
   EC_ALLOW_UNCALIBRATED=1
   ```
-  Routing then uses the model's plain yes/no. Still fails safe — any hint of
-  spam or a billing/account matter still goes to a human — but the confidence
+  Routing then uses the model's plain yes/no. Still fails safe — any
+  non-academic flag still goes to a human — but the confidence
   threshold no longer applies. Responses carry `"calibrated": false`.
 
 ### 5b. Other requirements
@@ -489,14 +525,18 @@ from the host. The safety logic lives here; the workflows are plumbing.
 | `GET /threads` / `GET /threads/{id}` | stored conversations / one conversation's turns |
 | `GET /review` | the review queue page — open this in a browser |
 | `GET /review/queue` | `{"pending": [...]}` → grounded replies awaiting a human, with a cached one-line `query_gist` |
+| `GET /knowledge` | every chunk as `{id, content, metadata, origin, edited, created_at, updated_at}`, plus the list of `sources`. |
+| `POST /knowledge` | `{"content": "...", "metadata": {...}}` → adds a manual chunk (embedded and pushed to Chroma). |
+| `GET` / `PUT` / `DELETE /knowledge/{id}` | one chunk. `PUT {"content"?, "metadata"?}` re-embeds and updates Chroma; `metadata` replaces the whole object. URL-encode the id (`#` → `%23`). 422 invalid input, 502 embedder/Chroma failure (row left unchanged). See §4a. |
 | `POST /review/{id}/send` | `{"reply": "..."}` → sends it via Graph (§6e) and records the sent text. 503 if Graph isn't configured yet, 502 if Graph rejected it — either way the row stays queued so nothing is silently lost. |
 
 Notes:
-- **`type`** collapses the three flags by priority **spam > administrative >
-  academic** — a mixed course-and-payment email is `administrative`, never
-  auto-answered.
+- **`type`** is `academic` only when the email is academic and nothing else;
+  everything else — a mixed course-and-payment email, spam, an email the model
+  set no flag on — is `non_academic`, never auto-answered. `unknown` means the
+  classification itself failed.
 - **`reply`** is the grounded answer, or the no-information line when the
-  documents do not cover it, or empty for administrative/spam/error.
+  documents do not cover it, or empty for non-academic/error.
 - **`format`** (`/answer`, `/generate-reply`, and echoed through
   `prepare`→`finalize`): `"auto"` (default) decides list vs prose from the
   enquirer's wording; `"list"` / `"prose"` force it.
@@ -512,14 +552,15 @@ curl -s -X POST http://127.0.0.1:8100/answer -H 'Content-Type: application/json'
 ## 11. Design notes
 
 **Multi-label, not single-label.** An email about the Level 2 syllabus *and* an
-unpaid invoice is genuinely both. Three independent booleans — `academic`,
-`administrative`, `spam` — set under a constrained grammar, so the logprob of
+unpaid invoice is genuinely both. Two independent booleans — `academic` and
+`non_academic` — set under a constrained grammar, so the logprob of
 each `true`/`false` token *is* P(label): a real number to sweep a threshold
 over, not a model role-playing "confidence: high".
 
 **Two independent gates, both failing to `human`.** Phase 1 (`classifier`) asks
 *may* this be auto-answered — `route()` returns `human` for anything
-administrative, spam, non-academic, below threshold, malformed or errored.
+non-academic (at or above `EC_NON_ACADEMIC_THRESHOLD`, default = `EC_THRESHOLD`),
+not academic, below threshold, malformed or errored.
 Phase 2 (`rag` / the agent) asks *can* it be, from what we actually hold — an
 email can clear the classifier and still have no answer in the documents
 (`grounded=false`). Neither step ever raises; failures arrive as an `error`
@@ -543,8 +584,8 @@ two and reported the third missing. At 3000 the section survives whole. A
 question about a section wants the section.
 
 **Threading — a follow-up does not classify as an email.** *"and what does the
-second one cover?"* alone scores academic 0.22 / spam 0.78 and routes to a
-human — it is a bag of stopwords with no institute in sight, so every
+second one cover?"* alone scored academic 0.22 / spam 0.78 (under the old
+three-label schema) and routed to a human — it is a bag of stopwords with no institute in sight, so every
 conversation used to die at the gate on its *second* message. `threads/` is the
 memory (SQLite, keyed by Outlook `conversationId`, deduped on
 `internetMessageId`). `classify()` takes optional `context`: it changes what
@@ -605,7 +646,8 @@ classifier/__main__.py    CLI:  python -m classifier "…"
 rag/core.py               ingest() + retrieve() + answer(), embed(), chunking, grounding
 rag/docx_text.py          .docx -> markdown, plus verify() for extraction loss
 rag/format_hint.py        list-vs-prose decision + as_bullets() coercion
-rag/__main__.py           CLI:  python -m rag  {ingest | ask | check | manifest}
+rag/knowledge.py          SQLite: knowledge_chunks, the editable copy of the collection
+rag/__main__.py           CLI:  python -m rag  {ingest | ask | check | manifest | knowledge}
 threads/store.py          SQLite: conversations + turns, dedupe on message id, review queue
 threads/context.py        history block + standalone-question rewrite + rolling summary
 threads/gist.py           one-line query summary for the review queue, cached per row
@@ -637,8 +679,8 @@ docker-compose.override.yml.example      per-host model-network wiring
 - No container is reachable off `127.0.0.1`. The review page has no login of
   its own — it inherits that same "trusted local network" boundary. Put it
   behind real auth before exposing it any wider.
-- Administrative and spam email never receive an automated reply, and never
-  reach the review queue at all.
+- Non-academic email (payments, records, spam) never receives an automated
+  reply, and never reaches the review queue at all.
 - Every factual sentence in a reply comes from `data/docs/`. If the documents
   do not cover a question, the email goes to the human queue rather than
   getting a guessed answer.

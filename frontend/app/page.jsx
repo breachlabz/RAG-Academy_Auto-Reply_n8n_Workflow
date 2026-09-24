@@ -5,6 +5,7 @@ import ReviewRow from "../components/ReviewRow";
 import HistoryRow from "../components/HistoryRow";
 import RowHeader from "../components/RowHeader";
 import ThreadCard from "../components/ThreadCard";
+import KnowledgeView from "../components/KnowledgeView";
 import { fetchHistory, fetchQueue } from "../lib/api";
 
 const REVIEW_LABELS = ["Received / drafted", "Enquiry", "AI reply", "Edit & send"];
@@ -40,7 +41,16 @@ function clusterBySender(groups) {
     .map(({ group }) => group);
 }
 
+// The tab lives in the URL hash so a reload (or a shared link) lands on the
+// same view. Hash, not a Next route: the static export is served by api.py
+// at exactly /review, and a second page would need its own FastAPI route.
+function tabFromHash() {
+  if (typeof window === "undefined") return "review";
+  return window.location.hash === "#knowledge" ? "knowledge" : "review";
+}
+
 export default function Page() {
+  const [tab, setTab] = useState("review");
   // Each entry: { conversation_id, conversation_subject, exchanges: [...] }
   // -- one card per thread, not one row per reply. See lib/api.js.
   const [groups, setGroups] = useState([]);
@@ -95,6 +105,18 @@ export default function Page() {
     return () => clearInterval(id);
   }, [load]);
 
+  useEffect(() => {
+    const sync = () => setTab(tabFromHash());
+    sync();
+    window.addEventListener("hashchange", sync);
+    return () => window.removeEventListener("hashchange", sync);
+  }, []);
+
+  function switchTab(next) {
+    window.location.hash = next === "knowledge" ? "knowledge" : "";
+    setTab(next);
+  }
+
   function handleSendSuccess(group, exchange) {
     fadingRef.current.set(exchange.id, {
       conversationId: group.conversation_id,
@@ -125,13 +147,37 @@ export default function Page() {
         <div className="dry-run-banner">Dry run</div>
       )}
       <header>
-        <h1>Reply review</h1>
-        <div className="toolbar">
-          <span className="count">{pendingCount ? `${pendingCount} pending` : ""}</span>
-          <button type="button" onClick={load}>Refresh</button>
-        </div>
+        <nav className="tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "review"}
+            className={"tab" + (tab === "review" ? " active" : "")}
+            onClick={() => switchTab("review")}
+          >
+            Reply review{pendingCount ? <span className="tab-count">{pendingCount}</span> : null}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "knowledge"}
+            className={"tab" + (tab === "knowledge" ? " active" : "")}
+            onClick={() => switchTab("knowledge")}
+          >
+            Knowledge
+          </button>
+        </nav>
+        {tab === "review" && (
+          <div className="toolbar">
+            <span className="count">{pendingCount ? `${pendingCount} pending` : ""}</span>
+            <button type="button" onClick={load}>Refresh</button>
+          </div>
+        )}
       </header>
 
+      {tab === "knowledge" && <KnowledgeView />}
+
+      {tab === "review" && (<>
       <section>
         <h2 className="section-title">Approval required to send</h2>
         {error && (
@@ -183,6 +229,7 @@ export default function Page() {
           </ThreadCard>
         ))}
       </section>
+      </>)}
     </div>
   );
 }
