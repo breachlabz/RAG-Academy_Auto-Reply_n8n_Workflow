@@ -1,91 +1,182 @@
-# Academy Auto-Reply — full setup on new hardware
+# Academy Auto-Reply — production setup, step by step
 
-Handover guide for **Davide**. Start from a bare Linux box with a GPU and end
-with the Outlook auto-reply pipeline running headless.
+Handover guide for whoever sets up the production server. It assumes **no
+prior experience** with Linux servers, Docker, n8n or Azure: every step says
+what to type, what you should see, and what to do if you don't.
 
-This covers the parts `README.md` assumes you already have — the OS, the GPU
-stack and the chat model server — then hands back to `README.md` for the
-application itself. Where a step is just "do what the README says", it says so;
-keep `README.md` open alongside this.
+Start from a bare Linux server with a GPU. Finish with the Outlook auto-reply
+pipeline running on its own, and a review page where a person approves every
+reply before it is sent.
+
+`README.md` has the deeper explanations (how the classifier decides, how
+replies are grounded, troubleshooting). You do not need it to finish this
+guide; it is referenced where it helps.
+
+---
+
+## Read this first (5 minutes)
 
 **What you are building**
 
 ```
-  Outlook mailbox ──▶ n8n ──▶ classifier API ──┬──▶ chromadb   (vector store)   ┐
-                              (FastAPI :8100)  └──▶ embedder   (bge-m3, CPU)    │ docker compose
-                                │        review queue (/review, human sends)   │ (this repo)
-                                │              │                               ┘
-                                ▼              ▼
-                    chat model server     Microsoft Graph (app-only, Send)
-                    (llama.cpp, ~27–32B,       │
-                     on the GPU)               ▼
-                    ← you set this up    Outlook mailbox (sent)
+  Outlook mailbox ──▶ n8n ──▶ classifier API ──┬──▶ Chroma      (stores the training documents)
+                              (port 8100)      └──▶ embedder    (turns text into vectors, CPU)
+                                │        review page (/review): a person reads, edits, sends
+                                ▼              │
+                    chat model server          ▼
+                    (llama.cpp on the GPU)   Microsoft Graph ──▶ reply leaves the mailbox
 ```
 
-The chat model does the classification **and** the reply drafting. Everything
-else is CPU. Nothing sends automatically — every reply waits in the review
-queue until a human sends it (§10a, README §14).
+- Every incoming email is classified as **academic** (a question about courses,
+  levels, exams, prices) or **non-academic** (invoices, refunds, account
+  problems, spam — anything else).
+- Only academic emails get a drafted reply, written **only** from the Word
+  documents in `data/docs/`. Non-academic emails are left for a person.
+- **Nothing is ever sent automatically.** Drafts wait on the review page until
+  a person clicks Send.
+
+**How to use this guide**
+
+- Do the sections **in order**. Each one ends with a **✅ Check** — do not move
+  on until it passes.
+- Lines in grey boxes are commands. Copy them **one block at a time** into the
+  terminal and press Enter. Lines starting with `#` are comments — they are
+  there to explain, pasting them does nothing harmful.
+- Anything in `<angle brackets>` is a placeholder: replace the whole thing,
+  brackets included, with your real value. Example: `ssh <user>@<server-ip>`
+  becomes `ssh maria@10.0.0.25`.
+- `sudo` runs a command as administrator. The first time it asks for **your**
+  password; nothing appears on screen while you type it — that is normal.
+- If a command prints an error you don't understand, **stop**, copy the full
+  error text, and ask. Do not improvise fixes on a production server.
+
+**Editing a file on the server (you will need this in §6)**
+
+We use `nano`, a simple text editor that runs in the terminal:
+
+```sh
+nano .env            # opens the file
+```
+
+- Move with the arrow keys and type normally.
+- **Save:** press `Ctrl+O`, then `Enter`.
+- **Quit:** press `Ctrl+X`.
+- Pasting: right-click in most terminals, or `Ctrl+Shift+V`.
+
+**Never do these on the production server**
+
+- `docker compose down -v` — the `-v` **deletes** the n8n login, the Outlook
+  connection and the document store.
+- Delete or overwrite the `data/` folder — it holds every conversation, the
+  review queue and your knowledge-base edits.
+- Share or commit the `.env` file — it contains secrets.
 
 ---
 
-## 0. Before you start — what you need
+## 0. Collect these before you start
 
-| Thing | Detail |
-|---|---|
-| Linux host, root/sudo | Ubuntu 22.04 or 24.04 LTS assumed below. Adjust package names for other distros. |
-| NVIDIA GPU, **≥ 24 GB VRAM** | for a 32B model at Q4. 16 GB works with a 14B (more misses — see README §5). No GPU → see §3 note. |
-| ~60 GB free disk | model weights (~20 GB) + embedding model (~2 GB) + docker images + headroom |
-| Outbound internet | to pull images, model weights, and reach Microsoft Graph |
-| A Microsoft 365 tenant where you can **create an app registration** | §7 |
-| The mailbox account credentials | the inbox this will watch |
-| This repo | `git clone https://github.com/breachlabz/RAG-Academy_Auto-Reply_n8n_Workflow.git` (or the folder handed to you) |
+Ask for anything you don't have **before** starting — you will be blocked
+halfway otherwise.
 
-Time: about 1–2 hours, most of it model download and the Azure screens.
+| You need | From whom / where | Used in |
+|---|---|---|
+| SSH access to the server: its **IP address**, a **username**, and your password or key | whoever provides the server | everywhere |
+| `sudo` (administrator) rights on it | same | §1–§4 |
+| The server has an **NVIDIA GPU with ≥ 24 GB memory** (16 GB works with a smaller model) | same | §2, §4 |
+| ~60 GB free disk space | same | §4 |
+| The server can reach the internet | same | downloads, Microsoft Graph |
+| Access to the Git repository (GitHub account with read access), **or** the project folder handed to you | project owner | §5 |
+| A Microsoft 365 **admin**, or someone who can create an "App registration" and click "Grant admin consent" | your Microsoft 365 / IT admin | §7, §10a |
+| The **mailbox** this will watch: its email address and a way to sign in to it | IT / mailbox owner | §9a, §10a |
+| A password manager to store the secrets you create | — | throughout |
+
+Time: about 2–3 hours for a first-timer, most of it waiting for downloads and
+the Azure screens.
+
+**Connect to the server** from your own computer (Windows: open *PowerShell*;
+Mac/Linux: open *Terminal*):
+
+```sh
+ssh <user>@<server-ip>
+```
+
+The first time it asks *"Are you sure you want to continue connecting?"* —
+type `yes`. Every command in §1–§6 is typed **in this SSH session**.
+
+✅ **Check:** your prompt now shows the server's name, e.g. `maria@academy-srv:~$`.
 
 ---
 
-## 1. Base OS packages
+## 1. Base system packages
 
 ```sh
 sudo apt update && sudo apt -y upgrade
-sudo apt -y install curl git jq build-essential ca-certificates gnupg
-sudo reboot        # if the upgrade pulled a new kernel
+sudo apt -y install curl git jq nano build-essential ca-certificates gnupg
 ```
 
-Optional but recommended — a non-root user in the `docker` group (created in §4).
-
----
-
-## 2. NVIDIA driver
+If the upgrade mentions a new kernel or asks to restart:
 
 ```sh
-sudo apt -y install ubuntu-drivers-common
-sudo ubuntu-drivers autoinstall           # or: sudo apt -y install nvidia-driver-550
 sudo reboot
 ```
 
-After the reboot:
+This disconnects you. Wait one minute, then `ssh <user>@<server-ip>` again.
 
-```sh
-nvidia-smi        # must print the GPU, driver version, and CUDA version
-```
-
-If `nvidia-smi` fails: secure boot can block the unsigned module — either
-disable secure boot in the BIOS or enrol the MOK key the installer offered.
+✅ **Check:** `git --version` prints a version number.
 
 ---
 
-## 3. Docker + NVIDIA Container Toolkit
+## 2. NVIDIA driver (lets the server use the GPU)
 
-**Docker Engine + Compose v2:**
+```sh
+sudo apt -y install ubuntu-drivers-common
+sudo ubuntu-drivers autoinstall
+sudo reboot
+```
+
+Reconnect with `ssh` after a minute, then:
+
+```sh
+nvidia-smi
+```
+
+✅ **Check:** a table showing the GPU name, its memory (e.g. `24576MiB`), a
+driver version and a CUDA version.
+
+If it says `command not found` or `couldn't communicate with the NVIDIA
+driver`: the server's *Secure Boot* is probably blocking the driver. This
+needs someone with access to the server's BIOS/console — ask the server
+provider to disable Secure Boot or enrol the driver key, then re-run
+`nvidia-smi`.
+
+> **No GPU at all?** Skip §2 and remove `--gpus all` from §4b. The model then
+> runs on the CPU — it works, but each email takes 30–90 seconds.
+
+---
+
+## 3. Docker (runs every part of the system in containers)
+
+**Install Docker:**
 
 ```sh
 curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker "$USER"           # log out/in afterwards for this to take effect
-docker compose version                    # must print v2.x
+sudo usermod -aG docker "$USER"
 ```
 
-**NVIDIA Container Toolkit** (lets containers see the GPU):
+The second line lets you use Docker without `sudo`, but only after you log
+out and back in:
+
+```sh
+exit
+```
+
+then `ssh <user>@<server-ip>` again.
+
+✅ **Check:** `docker compose version` prints `Docker Compose version v2.…`
+(no `sudo` needed). If it says *permission denied*, you did not log out and
+back in.
+
+**Let containers use the GPU** (skip if you have no GPU):
 
 ```sh
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
@@ -98,48 +189,45 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-Verify the GPU is visible from a container:
-
 ```sh
 docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 ```
 
-> **No GPU at all?** You can run the chat model on CPU (llama.cpp works, just
-> slow — expect 30–90 s per email) or point `LLM_URL` at a chat model on
-> another machine. Skip §2 and the `--gpus all` flag in §5; everything else is
-> unchanged.
+✅ **Check:** the same GPU table as in §2, this time printed from inside a
+container.
 
 ---
 
-## 4. The chat model server (llama.cpp)
+## 4. The chat model (the AI that classifies and writes replies)
 
-We run **one** instruction model behind an OpenAI-compatible endpoint. The
-classifier needs three things from it (all satisfied by current llama.cpp):
+One instruction model runs on the GPU and answers on port 8080. The
+classifier needs three things from it — the checks in §4c confirm all three:
 
-- **token logprobs** — the classifier reads P(`true`/`false`) to score
-  confidence. No logprobs ⇒ every email routes to a human, silently.
-- **JSON-schema constrained decoding** (`response_format: json_schema`).
-- **no hidden "thinking" tokens** in the output.
+- **token probabilities ("logprobs")** — used to measure how sure the model
+  is. Without them every email silently goes to a person.
+- **JSON output on request.**
+- **no hidden "thinking" text** in its answers.
 
-Using a **non-reasoning** model (Qwen2.5-32B-Instruct) means there is no
-thinking to disable — the simplest correct choice. Qwen3 also works but needs
-its thinking mode turned off (see the note at the end of this section).
+We use **Qwen2.5-32B-Instruct**, which meets all three out of the box.
 
-### 4a. Download the weights
+### 4a. Download the model (~20 GB — this takes a while)
 
 ```sh
 sudo mkdir -p /opt/models && sudo chown "$USER" /opt/models
 cd /opt/models
-# Qwen2.5-32B-Instruct, Q4_K_M (~19.9 GB). Fits a 24 GB card with an 8–16k context.
 curl -L -o qwen2.5-32b-instruct-q4_k_m.gguf \
   "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q4_K_M.gguf?download=true"
 ```
 
-Smaller card: use `bartowski/Qwen2.5-14B-Instruct-GGUF` → `Q4_K_M` (~9 GB) and
-set `CHAT_MODEL=qwen2.5-14b` throughout. The classifier still fails safe; it
-just sends more borderline mail to the human queue (README §5, §11).
+A progress bar runs until the download is done.
 
-### 4b. Run it
+**GPU with only 16 GB?** Download the smaller model instead:
+`bartowski/Qwen2.5-14B-Instruct-GGUF` → file `Qwen2.5-14B-Instruct-Q4_K_M.gguf`
+(~9 GB), and everywhere below use `qwen2.5-14b` instead of `qwen2.5-32b`.
+
+✅ **Check:** `ls -lh /opt/models` shows the `.gguf` file at roughly 19–20 GB.
+
+### 4b. Start the model server
 
 ```sh
 docker run -d --name llama --restart unless-stopped --gpus all \
@@ -152,23 +240,30 @@ docker run -d --name llama --restart unless-stopped --gpus all \
   -c 16384 -ngl 999 --jinja
 ```
 
-- `--host 0.0.0.0` — **required** so the compose stack can reach it via
-  `host.docker.internal` (README §3). Since port 8080 is now open on the box,
-  keep the machine behind a firewall / not on the public internet, or bind to
-  the docker bridge IP `172.17.0.1:8080` instead of `0.0.0.0`.
-- `-c 16384` — context window. Must be ≥ 8192 (drafting prompt is long).
-- `-ngl 999` — all layers on the GPU. Drop to a number (e.g. `-ngl 40`) if you
-  run out of VRAM; the rest runs on CPU.
-- `--alias qwen2.5-32b` — the model name the endpoint reports. This is what
-  goes in `CHAT_MODEL`.
+What the important options mean (don't change them unless told to):
 
-Watch it load:
+- `--alias qwen2.5-32b` — the model's name. You will type this again in §6
+  and §10.
+- `--host 0.0.0.0` — lets the other containers reach it. **Port 8080 is then
+  open on the server**: the server must be behind a firewall and not directly
+  on the public internet. If unsure, ask whoever provides the server.
+- `-c 16384` — how much text the model can read at once. Keep it ≥ 8192.
+- `-ngl 999` — put the whole model on the GPU. If the log in the next step
+  says *out of memory*, run `docker rm -f llama` and repeat §4b with
+  `-ngl 40`.
+
+Watch it load (1–3 minutes):
 
 ```sh
-docker logs -f llama        # wait for "server is listening on http://0.0.0.0:8080", then Ctrl-C
+docker logs -f llama
 ```
 
-### 4c. Verify logprobs, JSON and no-thinking — do not skip
+Wait for a line containing `server is listening on http://0.0.0.0:8080`, then
+press `Ctrl+C` (this only stops *watching* the log; the server keeps running).
+
+### 4c. Verify the model — do not skip
+
+**Check 1 — answers and probabilities:**
 
 ```sh
 curl -s http://localhost:8080/v1/chat/completions \
@@ -177,41 +272,31 @@ curl -s http://localhost:8080/v1/chat/completions \
        "logprobs":true,"top_logprobs":3,"max_tokens":10}' | jq '.choices[0]'
 ```
 
-Pass criteria:
+✅ Pass: `"content": "ok"` (no `<think>` text), **and** a `"logprobs"` section
+containing a list of entries. If `logprobs` is `null`, stop and ask — the
+classifier cannot work without it.
 
-- `.message.content` is exactly `"ok"` — non-empty, no `<think>` block. Good.
-- `.logprobs.content` is a **populated array**. If it is `null`, logprobs are
-  off and the classifier cannot calibrate — fix the server before continuing
-  (with current llama.cpp it should just work).
-
-JSON schema check:
+**Check 2 — JSON output:**
 
 ```sh
 curl -s http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"qwen2.5-32b","messages":[{"role":"user","content":"Give me a JSON object with one key ok set to true"}],
        "response_format":{"type":"json_schema","json_schema":{"name":"t","schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}}},
        "max_tokens":50}' | jq -r '.choices[0].message.content'
-#   -> {"ok": true}
 ```
 
-> **If you use Qwen3 instead:** add `--reasoning-budget 0` to the llama.cpp
-> command (disables thinking). Re-run 4c and confirm `.message.content` has no
-> `<think>…</think>` wrapper. If it does, the classifier will get empty
-> classifications and route everything to a human.
+✅ Pass: prints `{"ok": true}` (spacing may differ).
 
-> **Alternatives to llama.cpp:**
-> - **Ollama** — easy, but its OpenAI endpoint returned no logprobs before
->   ~v0.12. If you go this route: install Ollama ≥ 0.12, `ollama pull
->   qwen2.5:32b`, set `OLLAMA_HOST=0.0.0.0`, `OLLAMA_CONTEXT_LENGTH=8192`,
->   `OLLAMA_KEEP_ALIVE=-1`, and run the 4c check. If logprobs come back `null`,
->   set `EC_ALLOW_UNCALIBRATED=1` in `.env` (README §5a) — still safe, just no
->   confidence threshold.
-> - **LiteLLM** in front of llama.cpp — only needed if you want one endpoint
->   for several models or central keys. Not required here.
+> **Using a Qwen3 model instead?** Add `--reasoning-budget 0` to the §4b
+> command (turns off "thinking") and re-run both checks.
+>
+> **Using Ollama instead of llama.cpp?** Needs Ollama ≥ 0.12 for logprobs. If
+> Check 1 shows `logprobs: null`, set `EC_ALLOW_UNCALIBRATED=1` in `.env`
+> (§6) — README §5a explains the trade-off.
 
 ---
 
-## 5. Get the project onto the box
+## 5. Get the project onto the server
 
 ```sh
 cd ~
@@ -219,304 +304,468 @@ git clone https://github.com/breachlabz/RAG-Academy_Auto-Reply_n8n_Workflow.git 
 cd email-classifier
 ```
 
-(Or drop the handed-over folder here and `cd` into it.)
+If Git asks for a username and password: the password must be a GitHub
+**personal access token**, not your GitHub password (GitHub → Settings →
+Developer settings → Personal access tokens). If you were handed the folder
+instead, copy it to `~/email-classifier` and `cd` into it.
 
-The training documents are already in `data/docs/` (EVH + ACP overviews, FAQs,
-level syllabi). To change them later: edit that folder and re-run the ingest in
-§7 of the README.
+✅ **Check:**
+
+```sh
+ls
+```
+
+shows (among others) `docker-compose.yml`, `.env.example` is present
+(`ls -a` shows hidden files), and `ls data/docs` lists the training `.docx`
+files.
+
+From here on, **every command runs inside `~/email-classifier`**. If you
+reconnect later, first run `cd ~/email-classifier`.
+
+> You do **not** need `docker-compose.override.yml.example` on a normal
+> server — ignore it. It is only for a machine where the chat model lives in
+> another Docker stack's private network.
 
 ---
 
 ## 6. Configure and start the stack
 
+### 6a. Create the settings file
+
 ```sh
 cp .env.example .env
+nano .env
 ```
 
-Edit `.env` — set exactly these three:
+Change exactly these three lines (the file explains each one):
 
 ```ini
-# llama.cpp on this same host, bound to 0.0.0.0 in §4b:
 LLM_URL=http://host.docker.internal:8080/v1
 LLM_KEY=
-CHAT_MODEL=qwen2.5-32b        # must match --alias from §4b
+CHAT_MODEL=qwen2.5-32b
 ```
 
-If the model runs on a **different** machine, use
-`LLM_URL=http://<that-ip>:8080/v1` instead and make sure the firewall allows it.
+- `LLM_URL` — where the model from §4 answers, as seen from a container. If
+  the model runs on a **different** machine, use
+  `http://<that-machine-ip>:8080/v1` instead.
+- `LLM_KEY` — leave empty for llama.cpp.
+- `CHAT_MODEL` — must be **exactly** the `--alias` from §4b.
 
-Bring it up (from `email-classifier/`):
+Leave everything else as it is. In particular, **do not** add
+`REVIEW_DRY_RUN=1` — that is a testing switch that makes the Send button
+pretend to send.
+
+Save (`Ctrl+O`, `Enter`) and quit (`Ctrl+X`).
+
+✅ **Check:** `grep -E '^(LLM_URL|CHAT_MODEL)=' .env` prints your two values.
+
+### 6b. Build and start everything
 
 ```sh
 docker compose up -d --build
-docker compose logs -f embedder      # wait for "Ready" / "Starting HTTP server", then Ctrl-C (first boot pulls ~2 GB)
-docker compose ps                    # n8n, classifier, local_chromadb, embedder all "Up"
-curl -s http://127.0.0.1:8100/health ; echo      # {"ok":true}
 ```
 
-Load the documents into the vector store and prove retrieval works end to end
-(this call hits your llama.cpp):
+The first run downloads and builds several parts — expect 5–15 minutes. It
+ends with lines like `Container email-classifier-api  Started`.
+
+The embedder downloads its own model (~2 GB) on first start. Watch it:
+
+```sh
+docker compose logs -f embedder
+```
+
+Wait for `Ready` or `Starting HTTP server`, then `Ctrl+C`.
+
+✅ **Check:**
+
+```sh
+docker compose ps
+```
+
+Four rows — `email-classifier-api`, `email-classifier-chroma`,
+`email-classifier-embedder`, `n8n` — all with status `Up` (the API also shows
+`(healthy)` after about 30 seconds). Then:
+
+```sh
+curl -s http://127.0.0.1:8100/health ; echo
+```
+
+prints `{"ok":true}`.
+
+### 6c. Load the training documents
 
 ```sh
 docker compose exec classifier python -m rag ingest --reset
-#   "NNN chunks -> collection 'docs'"
-docker compose exec classifier python -m rag ask "what are the training levels?"
-#   a real answer drawn from the docs + source headings
 ```
 
-If either fails, README §9 has the symptom→fix table. The usual culprit is
-`LLM_URL` not being reachable from the container — recheck §4b (`--host
-0.0.0.0`) and that `curl http://127.0.0.1:8080/v1/models` answers on the host.
+✅ **Check:** prints `NNN chunks -> collection 'docs'` (a number around 50–60)
+followed by the list of documents.
+
+This also fills the **knowledge table** — the editable copy of the documents
+you will see in the review page's **Knowledge** tab (§12).
+
+Prove the whole chain works (this asks the model a real question):
+
+```sh
+docker compose exec classifier python -m rag ask "what are the training levels?"
+```
+
+✅ **Check:** a short answer about the EVH/ACP levels, followed by source
+headings. If instead you get *"we don't have relevant information"* or an
+error, see §11's table — nearly always `LLM_URL` is wrong or the model from §4
+isn't running (`docker ps` should list `llama`).
+
+**Check the classifier:**
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/classify -H 'Content-Type: application/json' \
+  -d '{"text":"What does EVH Level 3 module 2.4 cover?"}' ; echo
+curl -s -X POST http://127.0.0.1:8100/classify -H 'Content-Type: application/json' \
+  -d '{"text":"I was charged twice for my course, please refund me."}' ; echo
+```
+
+✅ **Check:** the first prints `"type":"academic","route":"rag"`, the second
+`"type":"non_academic","route":"human"`.
 
 ---
 
-## 7. Register the app in Microsoft Entra (Azure AD)
+## 7. Register the inbox-reading app in Microsoft Entra (Azure)
 
-This is what lets n8n read the inbox and create drafts. You need the **Client
-ID** and a **Client secret** at the end.
+This lets n8n read the mailbox. At the end you will have a **Client ID** and a
+**Client secret** — store both in your password manager as you go.
 
-1. <https://portal.azure.com> → **Microsoft Entra ID** → **App registrations**
-   → **New registration**.
+You need a Microsoft 365 account that can create app registrations. Step 7
+needs an **admin** to click one button; if that isn't you, do steps 1–6 and
+send the admin the app's name.
+
+1. Open <https://portal.azure.com> → search for **Microsoft Entra ID** → left
+   menu **App registrations** → **New registration**.
 2. **Name**: `academy-email-autoreply`. **Supported account types**: *Accounts
-   in this organizational directory only* (single tenant) is fine.
-3. **Redirect URI**: platform **Web**, value **exactly**:
+   in this organizational directory only*.
+3. **Redirect URI**: choose platform **Web**, and enter **exactly**:
    ```
    http://localhost:5678/rest/oauth2-credential/callback
    ```
-   Microsoft rejects plain-`http` redirects *except* on `localhost` — this is
-   why n8n stays on localhost and you reach it over an SSH tunnel (§8).
-4. **Register**.
-5. **Overview** → copy the **Application (client) ID**.
-6. **Certificates & secrets** → **Client secrets** → **New client secret** →
-   pick 12–24 months → **Add** → copy the **Value** immediately (it is hidden
-   once you leave the page). This is the **Client secret**.
-7. **API permissions** → **Add a permission** → **Microsoft Graph** →
-   **Delegated permissions** → add:
-   - `Mail.Read`
-   - `offline_access`
+4. Click **Register**.
+5. On the **Overview** page, copy the **Application (client) ID** → this is the
+   **Client ID**.
+6. Left menu **Certificates & secrets** → **Client secrets** → **New client
+   secret** → expiry 12–24 months → **Add**. Copy the **Value** column
+   **immediately** — it is hidden forever once you leave the page. This is the
+   **Client secret**. (Put a reminder in your calendar for its expiry date —
+   the pipeline stops reading mail when it expires.)
+7. Left menu **API permissions** → **Add a permission** → **Microsoft Graph**
+   → **Delegated permissions** → tick `Mail.Read` and `offline_access` → **Add
+   permissions**. Then **Grant admin consent for <your organisation>** → Yes.
 
-   Then **Grant admin consent for <tenant>** (needs an admin; if you are not
-   one, ask your Microsoft 365 admin to click it). Both should show a
-   green tick.
+✅ **Check:** both permissions show a green tick under *Status*.
 
-   Read-only on purpose: this app registration is only for **polling the
-   inbox**. Nothing in n8n creates a draft or sends any more — that moved to
-   the review queue (§10a/§12), which uses a *second*, app-only registration
-   with its own `Mail.Send` permission, not this one.
-
-Keep the Client ID and secret to hand for §9.
+This app can only **read** mail. Sending uses a second, separate app (§10a).
 
 ---
 
-## 8. Reach the n8n UI (SSH tunnel)
+## 8. Open the web pages from your computer (SSH tunnel)
 
-n8n is bound to `127.0.0.1:5678` on the box and is never exposed — it runs
-arbitrary workflow code. From your laptop:
+For safety, n8n (port 5678) and the review page (port 8100) only listen **on
+the server itself** — they are not reachable from the network. You reach them
+through an "SSH tunnel": your computer forwards those ports over your SSH
+connection.
+
+On **your own computer**, open a **new** terminal window (keep it open while
+you use the pages):
 
 ```sh
-ssh -L 5678:127.0.0.1:5678 <user>@<the-box>
-# leave that session open, then on your laptop browser open:
-#   http://localhost:5678
+ssh -L 5678:127.0.0.1:5678 -L 8100:127.0.0.1:8100 <user>@<server-ip>
 ```
 
-The address must be exactly `http://localhost:5678` — Entra only accepts
-`http://localhost` (not `127.0.0.1`, not a hostname) as the OAuth redirect.
+Now in your browser:
 
-On first load n8n asks you to create an **owner account** — this is local to the
-box, use any email/password and keep it in the password manager.
+- n8n: **<http://localhost:5678>** — must be exactly `localhost`, not
+  `127.0.0.1` (Microsoft only accepts `localhost` for the sign-in in §9a).
+- Review page: **<http://localhost:8100/review>**
 
-The tunnel and browser are only for setup and later maintenance. Once the
-workflow is **Active**, the pipeline runs headless.
+First time in n8n it asks you to create an **owner account** — it exists only
+on this server. Use any email and a strong password, and store it in the
+password manager.
+
+✅ **Check:** both pages load. The review page says *"Nothing waiting for
+review."*
+
+Every time you want to use either page later, open this tunnel first.
 
 ---
 
-## 9. Create the n8n credentials
+## 9. Create the four n8n credentials
 
-**Credentials** (left sidebar) → **Add credential**, four of them:
+In n8n: left sidebar **Credentials** (or **Overview → Credentials**) → **Add
+credential** (or **Create → Credential**). Create these four.
 
 ### 9a. Microsoft Outlook OAuth2 API
+- Search for and pick **Microsoft Outlook OAuth2 API**.
 - **Client ID** / **Client Secret**: from §7.
-- Confirm the **OAuth Redirect URL** shown matches the Entra one character for
-  character.
-- **Connect my account** → sign in as the **mailbox account** → consent.
-- Must end on **Connected / Account connected**.
+- Check the **OAuth Redirect URL** shown on the form is character-for-character
+  the one you entered in §7 step 3.
+- Click **Connect my account** → sign in **as the mailbox** → accept.
+
+✅ **Check:** the credential shows **Account connected**.
 
 ### 9b. Chat model — type **OpenAI API**
 - Name it `Chat model (llama.cpp)`.
-- **Base URL**: `http://host.docker.internal:8080/v1`
-  *(the n8n container reaches the host the same way the classifier does — if
-  your model is on another box, use that address here too).*
-- **API Key**: any non-empty string (llama.cpp ignores it) — e.g. `x`.
+- **Base URL**: `http://host.docker.internal:8080/v1` (same address as
+  `LLM_URL` in §6a).
+- **API Key**: type `x` (llama.cpp ignores it, but the field can't be empty).
 
-### 9c. Embedder — type **OpenAI API**  ← separate from 9b, easy to miss
+### 9c. Embedder — type **OpenAI API** (a second one — easy to miss)
 - Name it `Embedder (bge-m3)`.
-- **Base URL**: `http://embedder:80/v1`  *(the embedder container, inside the
-  compose network — this is **not** your chat model)*.
-- **API Key**: any non-empty string — e.g. `x`.
+- **Base URL**: `http://embedder:80/v1` — this is **not** the chat model.
+- **API Key**: `x`.
 
 ### 9d. Chroma — type **Chroma API** (self-hosted)
 - Name it `Chroma (academy_docs)`.
 - **Base URL**: `http://email-classifier-chroma:8000`
 - No authentication.
-- This is the same store `python -m rag ingest` writes to.
+
+This is the same document store §6c loaded, so n8n and the review page's
+Knowledge tab always see the same content.
 
 ---
 
-## 10. Import and wire the workflow
+## 10. Import and connect the workflow
 
-1. **Workflows → ⋯ (top-right) → Import from File** →
-   `n8n/academy-agent-workflow.json`.
-2. Open the nodes flagged with a red credential warning and attach:
+1. n8n → **Workflows** → **⋯** menu (top right) → **Import from File** →
+   choose `n8n/academy-agent-workflow.json`. (You need the file on your
+   computer: download it from the repository on GitHub, or copy it off the
+   server with `scp <user>@<server-ip>:email-classifier/n8n/academy-agent-workflow.json .`
+   run on your computer.)
+2. Nodes with a missing credential show a red warning. Open each and pick the
+   credential:
 
    | Node | Credential |
    |---|---|
-   | **New Outlook email** (trigger) | Outlook OAuth2 (9a) |
+   | **New Outlook email** (the trigger) | Outlook OAuth2 (9a) |
    | **Local Model** | Chat model (9b) |
    | **Embeddings bge-m3** | **Embedder (9c)** — not the chat model |
    | **academy_docs** | Chroma (9d) |
 
-3. Open **Local Model** and set the model to your alias — `qwen2.5-32b`
-   (the imported file has an older name cached).
-4. Open **academy_docs** and confirm the collection is **`docs`**.
-5. Open **New Outlook email** — set the folder (default **Inbox**) and poll
-   interval (default **every minute**).
-6. **Save**.
+3. Open **Local Model** → set the model to `qwen2.5-32b` (your `--alias`).
+4. Open **academy_docs** → the collection must be **`docs`**.
+5. Open **New Outlook email** → folder **Inbox**, poll **every minute**.
+6. Click **Save**.
 
-> Re-importing the workflow later **wipes credential bindings and the Active
-> toggle**. Re-attach and re-activate after any import.
+Do **not** turn the workflow on (Active) yet — that is §11.
 
-The imported topology is `Prepare → Is label "Academy"? → AI Agent → Finalize →
-Grounded answer? → Record reply`, with the false branches going to *Do
-nothing* / *Human queue*. That is the intended wiring — nothing to re-wire.
-`Record reply` is the workflow's last node now: it hands the reply to the
-**review queue** (§9e) rather than creating an Outlook draft. (README §1 has
-the node-by-node table.)
+> Re-importing this file later **removes** the credential links and switches
+> the workflow off. Redo steps 2–6 after any re-import.
 
-`n8n/email-classifier-form-workflow.json` is an optional manual test form — import
-it the same way, it needs no credentials.
+Optional: import `n8n/email-classifier-form-workflow.json` the same way. It's
+a manual test form and needs no credentials.
+
+✅ **Check:** no red warnings remain on any node.
 
 ---
 
-## 10a. Set up sending (review queue, app-only Graph)
+## 10a. Set up sending (review page → Microsoft Graph)
 
-The review queue lives at `http://<box>:8100/review` — same host as the
-classifier API, no tunnel needed once you're on that network. It reads and
-lets you edit every grounded reply for free; the **Send** button additionally
-needs its own Graph credential, separate from §7/9a because sending has to
-work with nobody signed in:
+The **Send** button needs its own Microsoft app, because it has to work with
+nobody signed in. Until this is done, the review page still works for
+reading and editing, and Send shows a clear *"not configured"* message instead
+of sending.
 
-1. Entra ID → App registrations → **New registration** — a second app, e.g.
-   `academy-email-send`. Do not reuse §7's app or add this permission to it.
-2. API permissions → Microsoft Graph → **Application permissions** (not
-   delegated) → add `Mail.Send` → **Grant admin consent**.
-3. Certificates & secrets → new client secret → copy the **Value**.
-4. Copy the **Application (client) ID** and **Directory (tenant) ID**.
-5. In `.env`:
-   ```ini
-   GRAPH_TENANT_ID=<tenant id>
-   GRAPH_CLIENT_ID=<client id>
-   GRAPH_CLIENT_SECRET=<secret value>
-   GRAPH_MAILBOX=<mailbox sign-in email>
+1. <https://portal.azure.com> → **Microsoft Entra ID** → **App registrations**
+   → **New registration** → name `academy-email-send` → **Register**. (A
+   *new* app — do not reuse the one from §7.)
+2. **API permissions** → **Add a permission** → **Microsoft Graph** →
+   **Application permissions** (not *Delegated*) → tick `Mail.Send` → **Add**
+   → **Grant admin consent**.
+3. **Certificates & secrets** → new client secret → copy the **Value** now.
+4. **Overview** → copy **Application (client) ID** and **Directory (tenant)
+   ID**.
+5. On the server:
+   ```sh
+   cd ~/email-classifier
+   nano .env
    ```
-6. `docker compose up -d`.
+   Add these four lines at the end (no spaces around `=`):
+   ```ini
+   GRAPH_TENANT_ID=<directory (tenant) id>
+   GRAPH_CLIENT_ID=<application (client) id>
+   GRAPH_CLIENT_SECRET=<secret value>
+   GRAPH_MAILBOX=<the mailbox's email address>
+   ```
+   Save and quit.
+6. Apply the change:
+   ```sh
+   docker compose up -d
+   ```
 
-Until this is done, `/review` still works for reading/editing; **Send**
-returns a clear "not configured" error instead of pretending to send. Full
-detail: README §6e.
+✅ **Check:** `docker compose ps` shows the API `Up (healthy)` again after
+~30 seconds.
+
+> `Mail.Send` as an application permission can send as **any** mailbox in the
+> tenant. Ask your Microsoft 365 admin whether to restrict this app to the one
+> mailbox (Exchange Online supports this for app registrations).
 
 ---
 
-## 11. End-to-end test (workflow still inactive)
+## 11. End-to-end test
 
-Use the built-in manual trigger first — in the workflow, click **Test: run
-manually**. It feeds a canned academic email through `Prepare → … → Finalize`
-without touching Outlook. Expect the execution to reach **Finalize** with
-`grounded: true` and a drafted reply body.
+**Dry run inside n8n (no real email):** open the workflow → click **Test
+workflow** / **Execute workflow** on the *Test: run manually* trigger.
 
-Then flip it live:
+✅ **Check:** the run reaches **Finalize** (nodes turn green) with
+`grounded: true`, and a new row appears on the review page.
 
-1. Toggle the workflow **Active**.
-2. From another account, email the mailbox:
+**Live test:**
+
+1. In n8n, switch the workflow to **Active** (toggle top right) → confirm.
+2. From a **different** email account, send the mailbox:
    > **Subject:** Course question
    > **Body:** What are the training levels and who is Level 2 aimed at?
-3. Within ~1–2 minutes a **row appears at `http://<box>:8100/review`**
-   listing the levels from the documents, with an edit box pre-filled. The
-   n8n execution ends at **Record reply**. Click **Send** there (needs §10a
-   done) to actually deliver it.
-4. Send a second email: *"My invoice still shows unpaid, can you check?"* →
-   **nothing queued**, execution ends at **Do nothing** (`reason: not routed
-   to rag`). This is correct — billing is never auto-answered.
+3. Within 1–2 minutes a row appears on **<http://localhost:8100/review>**
+   (tunnel open) with a drafted reply built from the documents.
+4. Read it, edit if you like, click **Send**.
 
-If the first test produced no queue row, open the failed execution and read
-the node output against README §7's table. Most common:
+✅ **Check:** the reply arrives in the sending account's inbox, with the
+original message quoted underneath.
 
-| Symptom (in the **Prepare** node output) | Fix |
+5. Send a second email: *"My invoice still shows unpaid, can you check?"*
+
+✅ **Check:** **no** row appears on the review page. In n8n the run ends at
+**Do nothing** with `reason: not routed to rag`. This is correct — billing
+is non-academic and is always left for a person.
+
+**If something doesn't match**, open the run in n8n (**Executions** in the
+left menu), click the red or last node, and compare with this table:
+
+| What you see | What to do |
 |---|---|
-| `error: expected 3 bools, got 0` | model returned no logprobs — recheck §4c; on Ollama set `EC_ALLOW_UNCALIBRATED=1` |
-| empty / garbled `flags` | model is emitting "thinking" — use the non-thinking model or `--reasoning-budget 0` (§4) |
-| `error: request failed …` | classifier can't reach llama.cpp — §6, README §9 |
-| ends at **Human queue** on an academic email | agent found no grounded answer — re-run `ingest --reset`, confirm the topic is in `data/docs/` |
-| row is in `/review`, but **Send** returns "not configured" | §10a not done yet — expected until `GRAPH_*` is set in `.env` |
-| **Send** returns a 502 from Graph | row stays queued, nothing lost — the error names what Graph rejected; check `Mail.Send` admin consent and that `GRAPH_MAILBOX` is a real mailbox |
+| **Prepare** output has `error: expected 2 bools, got 0` | the model returned no probabilities — redo §4c; on Ollama set `EC_ALLOW_UNCALIBRATED=1` in `.env`, then `docker compose up -d` |
+| **Prepare** output has `error: request failed …` | the API can't reach the model — check `LLM_URL` in `.env` (§6a) and that `docker ps` lists `llama` |
+| empty or garbled `flags` | the model is "thinking" — use Qwen2.5, or add `--reasoning-budget 0` (§4) |
+| an academic email ends at **Human queue** | the documents don't answer it — re-run §6c, and check the topic really is in `data/docs/` |
+| the trigger never fires | the Outlook credential (9a) shows *not connected* — reconnect it; the workflow must be **Active** |
+| **Send** says "not configured" | §10a not done, or `.env` has a typo — check the four `GRAPH_` lines, then `docker compose up -d` |
+| **Send** returns a 502 error | nothing is lost, the row stays. The message names what Microsoft rejected: usually admin consent for `Mail.Send` is missing, or `GRAPH_MAILBOX` is not a real mailbox |
+| review page won't load | the SSH tunnel from §8 isn't open |
+
+Still stuck: `docker compose logs --tail 100 classifier` shows the API's
+recent log — copy it into your question. README §9 has more symptoms.
 
 ---
 
-## 12. Going live / handover state
+## 12. Going live — and daily use
 
-Once the two test emails behave correctly:
+Once both test emails behave:
 
 - Leave the workflow **Active**.
-- Close the SSH tunnel — the pipeline now runs headless on its polling trigger.
-- **Nothing sends automatically.** Every grounded reply waits at `/review`
-  until a human reads it, optionally edits it, and clicks Send.
+- Close the SSH tunnel. The pipeline keeps running on its own on the server.
+- A person checks **/review** regularly (tunnel first): read each draft, edit
+  if needed, **Send**. Nothing leaves without that click.
 
-### Day-2 operations (full detail in README §8)
+### The Knowledge tab (tuning replies)
 
-| Task | Command (from `email-classifier/`) |
+The review page has a second tab, **Knowledge**. It lists every piece
+("chunk") of the training documents the replies are written from — its text
+and its details (*metadata*, shown as JSON).
+
+- **Edit** a chunk and **Save**: replies use the new text from the next email
+  on. Both the review page and n8n see it immediately.
+- **Add chunk**: add a fact that isn't in the documents yet. Write the topic
+  into the text itself ("EVH Level 2 kit calibration: …"), not only into the
+  heading — the text is what gets searched.
+- **Export JSON**: a copy of everything, for backup or review.
+- ⚠ **Re-loading the documents (§6c command) overwrites edits** to chunks that
+  came from a document. Chunks you *added* are kept. A permanent change
+  belongs in the Word document itself.
+
+The same thing from the command line: README §4a.
+
+### Routine tasks
+
+Run these from `~/email-classifier` on the server.
+
+| Task | Command |
 |---|---|
-| Change the training docs | edit `data/docs/`, then `docker compose exec classifier python -m rag ingest --reset` |
-| Update the app code | `git pull && docker compose up -d --build classifier` |
-| Change greeting / sign-off | `RAG_EMAIL_GREETING` / `RAG_EMAIL_SIGNOFF` in `.env`, then `docker compose up -d` |
-| Gate strictness | `EC_THRESHOLD` in `.env` (default `0.9`; higher → more mail to humans) |
+| Updated Word documents | replace the files in `data/docs/` (e.g. with `scp`), then `docker compose exec classifier python -m rag ingest --reset` |
+| Install a new version of the app | see §13 |
+| Change the greeting / sign-off | set `RAG_EMAIL_GREETING` / `RAG_EMAIL_SIGNOFF` in `.env`, then `docker compose up -d` |
+| Make the classifier stricter / looser | `EC_THRESHOLD` in `.env` (default `0.9`; higher → more mail to people), then `docker compose up -d` |
+| Is everything running? | `docker compose ps` and `docker ps` (the model is `llama`) |
 | Restart the model | `docker restart llama` |
-| Stop everything (keep data) | `docker compose stop` |
+| Restart the app | `docker compose restart classifier` |
+| Stop everything (data kept) | `docker compose stop`; start again with `docker compose start` |
+| After a server reboot | nothing — everything restarts on its own (check with `docker compose ps`) |
 
-### Back up (these hold all the state)
+### Backups — set these up on day one
 
 ```sh
-# n8n workflows + credentials + history
-docker run --rm -v email-classifier_n8n_data:/v -v "$PWD":/out alpine \
-  tar czf /out/n8n-backup.tgz -C /v .
-# conversation memory
-cp data/threads.db data/threads.db.bak
-# the vector store is rebuildable from data/docs/ with `ingest --reset` — no backup needed
+cd ~/email-classifier
+# 1. conversations, review queue, knowledge-base edits and added chunks
+docker compose exec classifier python -c "import sqlite3; s=sqlite3.connect('/app/data/threads.db'); d=sqlite3.connect('/app/data/threads.db.bak'); s.backup(d)"
+cp data/threads.db.bak ~/threads-$(date +%F).db
+# 2. n8n: workflows, credentials, run history
+docker run --rm -v email-classifier_n8n_data:/v -v "$HOME":/out alpine \
+  tar czf /out/n8n-backup-$(date +%F).tgz -C /v .
+# 3. settings and secrets
+cp .env ~/env-backup-$(date +%F)
 ```
 
-Never run `docker compose down -v` — the `-v` deletes the volumes, losing the
-n8n credentials (including the Outlook OAuth connection) and the vectors. The
-`GRAPH_*` send credential lives in `.env`, not a volume — back that up
-however you already handle secrets on this box.
+Copy those three files off the server to wherever your organisation keeps
+backups (they contain secrets — treat them like passwords). The document
+store needs no backup: `ingest --reset` rebuilds it from `data/docs/`, and
+added chunks come back from `threads.db`.
+
+Secrets expire: both Azure client secrets (§7, §10a) stop working on the
+date you chose. Renew them in the Azure portal before then, and update the
+Outlook credential in n8n and `GRAPH_CLIENT_SECRET` in `.env`.
 
 ---
 
-## 13. Quick checklist
+## 13. Installing a newer version later
 
-- [ ] `nvidia-smi` works on the host and inside a container
-- [ ] `docker compose version` is v2.x
-- [ ] llama.cpp up, `--host 0.0.0.0`, §4c logprobs check passes
-- [ ] `.env` has `LLM_URL`, `LLM_KEY`, `CHAT_MODEL` (matches `--alias`)
-- [ ] `docker compose ps` — 4 containers Up; `/health` ok
-- [ ] `python -m rag ingest --reset` ran; `python -m rag ask` returns a real answer
-- [ ] Entra trigger app: `Mail.Read` + `offline_access`, admin consent granted
-- [ ] n8n reached at `http://localhost:5678` via SSH tunnel; owner account created
-- [ ] 4 credentials created; Outlook shows **Connected**
-- [ ] workflow imported, 4 credential attachments done, Local Model set to your alias
-- [ ] manual test reaches Finalize `grounded: true`
-- [ ] second Entra app-only registration: `Mail.Send`, admin consent granted; `GRAPH_*` set in `.env` (§10a)
-- [ ] live: academic email → row at `/review`, Send delivers it; billing email → nothing queued
-- [ ] workflow left **Active**; backups taken
+```sh
+cd ~/email-classifier
+# back up first — §12 "Backups"
+git pull
+docker compose up -d --build classifier
+docker compose ps          # API "Up (healthy)" after ~30 s
+```
+
+Then read the release notes / commit message for extra steps. For the
+version that introduced the academic / non-academic classifier and the
+Knowledge tab, on a server that was **already running** an older version:
+
+1. Fill the knowledge table once from the existing document store:
+   ```sh
+   docker compose exec classifier python -m rag knowledge pull
+   ```
+   ✅ prints `NN chunks copied from collection 'docs' into knowledge_chunks`.
+2. If you use the optional test form, re-import
+   `n8n/email-classifier-form-workflow.json` (it shows the new scores).
+3. Re-run the two classifier checks at the end of §6c.
 
 ---
 
-*Questions on the internals — the gate, the grounding net, the threading model,
-the eval scripts — are all in `README.md` §10–§12.*
+## 14. Final checklist
+
+- [ ] `nvidia-smi` works on the server and inside a container (§2, §3)
+- [ ] `docker compose version` is v2.x, works without `sudo`
+- [ ] model server `llama` running; both §4c checks pass
+- [ ] `.env` has `LLM_URL`, `CHAT_MODEL` (= the `--alias`); **no** `REVIEW_DRY_RUN`
+- [ ] `docker compose ps` — 4 containers Up; `/health` returns `{"ok":true}`
+- [ ] `ingest --reset` done; `rag ask` gives a real answer; `/classify` checks pass
+- [ ] Entra app 1: `Mail.Read` + `offline_access`, admin consent ✔
+- [ ] n8n reached via SSH tunnel at `http://localhost:5678`; owner account saved
+- [ ] 4 n8n credentials; Outlook shows **Account connected**
+- [ ] workflow imported, 4 credentials attached, Local Model = your alias, saved
+- [ ] Entra app 2: `Mail.Send` (application), admin consent ✔; 4 `GRAPH_` lines in `.env`
+- [ ] test: academic email → row at `/review` → Send delivers it
+- [ ] test: invoice email → nothing queued
+- [ ] workflow **Active**; Knowledge tab shows the chunks
+- [ ] backups taken and copied off the server; secret expiry dates in the calendar
+
+---
+
+*How it works inside — the classifier gate, the grounding checks, threading,
+the knowledge table, the evaluation scripts — is in `README.md` §4a and
+§10–§12.*

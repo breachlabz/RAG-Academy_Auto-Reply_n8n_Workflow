@@ -70,6 +70,11 @@ services:
     # Do NOT rename this back to `chromadb:` without also repointing n8n's
     # "Chroma (ai-network)" credential and migrating this collection's data
     # -- see docker-compose.override.yml's comment on RAG_CHROMA_HOST.
+    #
+    # Since 2026-09-24 the base file points the classifier at this service
+    # (RAG_CHROMA_HOST=local_chromadb), so a fresh host is self-contained.
+    # The dev box that shares the ai-server Chroma keeps doing so by setting
+    # RAG_CHROMA_HOST=chromadb in its own override file.
 
   classifier:
     build: .
@@ -107,7 +112,12 @@ services:
       # use -- see api.py's REVIEW_DRY_RUN.
       - REVIEW_DRY_RUN=${REVIEW_DRY_RUN:-}
       # --- everything below is in-compose wiring, do not touch ------------
-      - RAG_CHROMA_HOST=chromadb
+      # This stack's own Chroma (local_chromadb above), which n8n's
+      # academy_docs credential also points at (email-classifier-chroma:8000)
+      # -- so ingest, /knowledge edits and both reply paths share one store.
+      # A host that deliberately shares another stack's Chroma overrides this
+      # in docker-compose.override.yml (see the .example).
+      - RAG_CHROMA_HOST=local_chromadb
       - RAG_CHROMA_PORT=8000
       - RAG_COLLECTION=docs
       - RAG_MAX_DISTANCE=1.0
