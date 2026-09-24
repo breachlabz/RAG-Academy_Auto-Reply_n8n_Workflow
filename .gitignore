@@ -1,6 +1,6 @@
 .env
 .venv/
-# per-host compose overrides (the .example is committed)
+# per-host compose overrides, never committed
 docker-compose.override.yml
 # data/* rather than data/, so the negation below can take effect -- git does
 # not descend into an excluded directory to un-exclude a child.

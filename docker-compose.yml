@@ -12,9 +12,8 @@
 #
 # Reaching the chat model: EC_BASE_URL / LLM_URL must be an address a container
 # can dial. A model server on THIS host bound to 127.0.0.1 only is NOT reachable
-# -- bind it to 0.0.0.0 (or the docker bridge IP) and use
-# http://host.docker.internal:<port>/v1, or put the model server on a docker
-# network this stack also joins (see docker-compose.override.yml.example).
+# -- bind it to the docker bridge IP (172.17.0.1) and use
+# http://host.docker.internal:<port>/v1. See README section 4a.
 
 services:
   # bge-m3 embeddings, CPU-only, OpenAI-compatible at /v1/embeddings. 1024-dim.
@@ -56,7 +55,7 @@ services:
     # ---------------------------------------------------------------------
     # INCIDENT (2026-09-22): this service used to be named `chromadb:`, which
     # is also the container_name of an unrelated, box-wide Chroma from the
-    # `ai-server` stack (see docker-compose.override.yml's `modelnet`).
+    # `ai-server` stack on the dev box.
     # RAG_CHROMA_HOST=chromadb on the classifier service resolves through
     # Docker's embedded DNS across BOTH networks it joins -- and it resolved
     # to that OTHER container, silently, the whole time. n8n's academy_docs
@@ -67,14 +66,10 @@ services:
     # inspects it via port 8011 expecting to see what's actually live.
     # Renaming the service key removes the alias collision for good: no
     # future restart-order change can flip which container "chromadb" means.
-    # Do NOT rename this back to `chromadb:` without also repointing n8n's
-    # "Chroma (ai-network)" credential and migrating this collection's data
-    # -- see docker-compose.override.yml's comment on RAG_CHROMA_HOST.
+    # Do NOT rename this back to `chromadb:`.
     #
-    # Since 2026-09-24 the base file points the classifier at this service
-    # (RAG_CHROMA_HOST=local_chromadb), so a fresh host is self-contained.
-    # The dev box that shares the ai-server Chroma keeps doing so by setting
-    # RAG_CHROMA_HOST=chromadb in its own override file.
+    # Since 2026-09-24 the classifier points at this service
+    # (RAG_CHROMA_HOST=local_chromadb), so every host is self-contained.
 
   classifier:
     build: .
@@ -92,6 +87,7 @@ services:
       # bigger one worth using for `--large` evals.
       - EC_LARGE_MODEL=${CHAT_MODEL_LARGE:-${CHAT_MODEL}}
       - EC_THRESHOLD=${EC_THRESHOLD:-0.9}
+      - EC_NON_ACADEMIC_THRESHOLD=${EC_NON_ACADEMIC_THRESHOLD:-${EC_THRESHOLD:-0.9}}
       # Ollama backends: see README.md "Chat model requirements". No-ops unset.
       - EC_ALLOW_UNCALIBRATED=${EC_ALLOW_UNCALIBRATED:-}
       - EC_NUM_CTX=${EC_NUM_CTX:-}
@@ -115,8 +111,6 @@ services:
       # This stack's own Chroma (local_chromadb above), which n8n's
       # academy_docs credential also points at (email-classifier-chroma:8000)
       # -- so ingest, /knowledge edits and both reply paths share one store.
-      # A host that deliberately shares another stack's Chroma overrides this
-      # in docker-compose.override.yml (see the .example).
       - RAG_CHROMA_HOST=local_chromadb
       - RAG_CHROMA_PORT=8000
       - RAG_COLLECTION=docs

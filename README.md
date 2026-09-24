@@ -194,10 +194,6 @@ docker logs -f llama     # until "server is listening"
   flags; still fails safe, but the confidence threshold no longer applies and
   responses carry `"calibrated": false`). If the context can't be raised
   server-side, `EC_NUM_CTX=8192`.
-- **Model in another compose stack on this host, reachable only on that
-  stack's network:** `cp docker-compose.override.yml.example
-  docker-compose.override.yml`, set the network name, and use
-  `LLM_URL=http://<service>:<port>/v1`. Not needed otherwise.
 
 ### 4c. Acceptance check
 
@@ -260,9 +256,6 @@ Optional:
 | `RAG_EMAIL_GREETING` / `RAG_EMAIL_SIGNOFF` | `Hello,` / `Best regards,\nThe Training Team` | Reply shell; `\n` = line break |
 | `CHAT_MODEL_LARGE` | `CHAT_MODEL` | Larger model for evaluation runs only |
 | `REVIEW_DRY_RUN` | unset | **Testing only.** Send marks rows sent without calling Graph. Must be unset in production. |
-
-`EC_NON_ACADEMIC_THRESHOLD` is read by the classifier; to change it, also add
-it to the `classifier` service `environment` in an override file.
 
 ### 5b. Start and load documents
 
@@ -457,7 +450,7 @@ Reply wording, thresholds and Graph credentials are all `.env`.
 |---|---|---|
 | Conversations, review queue, knowledge edits, manual chunks | `data/threads.db` (+ `-wal`) | SQLite online backup (below) — don't `cp` a live WAL database |
 | n8n workflows, credentials, execution history | volume `email-classifier_n8n_data` | tar of the volume |
-| Configuration and secrets | `.env`, `docker-compose.override.yml` if used | copy, encrypted at rest |
+| Configuration and secrets | `.env` | copy, encrypted at rest |
 | Vector store | volume `email-classifier_chroma-data` | not required: rebuilt by `ingest --reset` (manual chunks restored from `threads.db`) |
 
 ```sh
@@ -690,5 +683,4 @@ data/docs/                  source documents
 tests/test_logic.py         unit and regression tests
 scripts/                    generate / evaluate / rag_eval / thread_eval
 docker-compose.yml          the stack
-docker-compose.override.yml.example      optional per-host network wiring (§4b)
 ```
