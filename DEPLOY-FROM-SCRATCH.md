@@ -250,7 +250,7 @@ Bring it up (from `email-classifier/`):
 ```sh
 docker compose up -d --build
 docker compose logs -f embedder      # wait for "Ready" / "Starting HTTP server", then Ctrl-C (first boot pulls ~2 GB)
-docker compose ps                    # n8n, classifier, chromadb, embedder all "Up"
+docker compose ps                    # n8n, classifier, local_chromadb, embedder all "Up"
 curl -s http://127.0.0.1:8100/health ; echo      # {"ok":true}
 ```
 

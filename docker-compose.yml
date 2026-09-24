@@ -33,7 +33,10 @@ services:
   # Vector store. Internal only -- the API talks to it by service name. Pin the
   # tag to the chromadb version in requirements.txt so client and server speak
   # the same wire format.
-  chromadb:
+  # Service key is deliberately NOT "chromadb" -- see the incident below.
+  # This is this stack's own private Chroma, container_name
+  # email-classifier-chroma, holding the docs collection this stack ingests.
+  local_chromadb:
     image: chromadb/chroma:1.5.9
     container_name: email-classifier-chroma
     environment:
@@ -50,13 +53,30 @@ services:
     networks:
       - emailflow
     restart: unless-stopped
+    # ---------------------------------------------------------------------
+    # INCIDENT (2026-09-22): this service used to be named `chromadb:`, which
+    # is also the container_name of an unrelated, box-wide Chroma from the
+    # `ai-server` stack (see docker-compose.override.yml's `modelnet`).
+    # RAG_CHROMA_HOST=chromadb on the classifier service resolves through
+    # Docker's embedded DNS across BOTH networks it joins -- and it resolved
+    # to that OTHER container, silently, the whole time. n8n's academy_docs
+    # tool points at that same shared instance on purpose (its credential is
+    # literally named "Chroma (ai-network)"), so retrieval was still
+    # internally consistent -- but this stack's own private Chroma above sat
+    # completely unused, several ingests out of date, a trap for anyone who
+    # inspects it via port 8011 expecting to see what's actually live.
+    # Renaming the service key removes the alias collision for good: no
+    # future restart-order change can flip which container "chromadb" means.
+    # Do NOT rename this back to `chromadb:` without also repointing n8n's
+    # "Chroma (ai-network)" credential and migrating this collection's data
+    # -- see docker-compose.override.yml's comment on RAG_CHROMA_HOST.
 
   classifier:
     build: .
     container_name: email-classifier-api
     depends_on:
       - embedder
-      - chromadb
+      - local_chromadb
     environment:
       # --- your chat model, from .env ------------------------------------
       - EC_BASE_URL=${LLM_URL:?set LLM_URL in .env}

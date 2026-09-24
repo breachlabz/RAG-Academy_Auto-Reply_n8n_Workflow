@@ -117,6 +117,12 @@ _ADDED_COLUMNS = {
     # approves. NULL for rows recorded before this existed, or by a caller
     # that never waits on review (e.g. the one-call /generate-reply path).
     "resume_url": "TEXT",
+    # Original filename of a file the reviewer attached when sending, if any.
+    # This is the ONLY thing this app keeps about it -- the bytes themselves
+    # are never written to this DB or to disk; see api.py's review_send and
+    # mail/graph.py's send_reply, which pass them straight through to Graph
+    # in the one request and let them go out of scope after.
+    "attachment_name": "TEXT",
     # A scheduled follow-up on a thread, not a reply to a real inbound
     # question -- see create_followup(). `query` holds the topic (what to
     # draft about) rather than something the enquirer wrote, and `due_at` is
@@ -683,7 +689,11 @@ def set_query_gist(
 
 
 def mark_sent(
-    exchange_id: int, edited_reply: str, *, path: pathlib.Path | None = None
+    exchange_id: int,
+    edited_reply: str,
+    *,
+    attachment_name: str | None = None,
+    path: pathlib.Path | None = None,
 ) -> dict | None:
     """Record the human-approved final text and take the row out of the queue.
 
@@ -693,6 +703,10 @@ def mark_sent(
     checking whether a row was updated. Returns the row as it stood *before*
     this call so the caller (about to place the real Graph send) still has
     `ref` and `conversation_id` even though the row is now marked sent.
+
+    `attachment_name` is the filename only, for History's benefit -- the file
+    itself was already sent to Graph and discarded by the time this runs; see
+    attachment_name's comment on _ADDED_COLUMNS above.
     """
     row = get_exchange(exchange_id, path=path)
     if row is None or row["sent"]:
@@ -700,8 +714,8 @@ def mark_sent(
     with connect(path) as conn:
         conn.execute(
             """UPDATE exchanges
-                  SET edited_reply = ?, sent = 1, sent_at = ?
+                  SET edited_reply = ?, sent = 1, sent_at = ?, attachment_name = ?
                 WHERE id = ? AND sent = 0""",
-            (edited_reply, _now(), exchange_id),
+            (edited_reply, _now(), attachment_name, exchange_id),
         )
     return row

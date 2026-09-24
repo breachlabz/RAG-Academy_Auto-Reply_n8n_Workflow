@@ -3,7 +3,8 @@
 import { useRef, useState } from "react";
 import ClampedText from "./ClampedText";
 import { sendReply } from "../lib/api";
-import { applyCase, wrapSelection } from "../lib/textFormat";
+import { applyCase, toggleList, wrapSelection } from "../lib/textFormat";
+import { AttachmentTooLargeError, readFileAsAttachment } from "../lib/attachment";
 
 function fmtDate(iso) {
   if (!iso) return "—";
@@ -29,7 +30,28 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState(null); // { kind: "ok" | "error", message }
   const [sent, setSent] = useState(false);
+  const [attachment, setAttachment] = useState(null); // { name, contentType, base64 } | null
+  const [attachmentError, setAttachmentError] = useState(null);
   const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  // One file only. Read fully into memory here, in state -- never sent
+  // anywhere until Send is clicked, and never persisted client-side either
+  // (no localStorage): see lib/attachment.js.
+  async function onAttachmentPicked(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // lets picking the same file again re-fire onChange
+    if (!file) return;
+    setAttachmentError(null);
+    try {
+      setAttachment(await readFileAsAttachment(file));
+    } catch (err) {
+      setAttachment(null);
+      setAttachmentError(
+        err instanceof AttachmentTooLargeError ? err.message : "Could not read that file."
+      );
+    }
+  }
 
   // Runs a transform (applyCase/wrapSelection from lib/textFormat) against
   // the textarea's current native selection, applies the result, then
@@ -53,7 +75,7 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
     setBusy(true);
     setStatus(null);
     try {
-      const result = await sendReply(row.id, text);
+      const result = await sendReply(row.id, text, attachment);
       setStatus({
         kind: "ok",
         message: result.dry_run ? "Recorded (dry run — nothing sent)." : "Sent.",
@@ -114,6 +136,13 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
           <button type="button" title="Italic (*text*)" className="format-italic" onClick={() => runFormat((t, s, e) => wrapSelection(t, s, e, "*"))}>
             I
           </button>
+          <span className="format-toolbar-sep" />
+          <button type="button" title="Bulleted list (toggle on the selected lines)" onClick={() => runFormat((t, s, e) => toggleList(t, s, e, "bullet"))}>
+            • List
+          </button>
+          <button type="button" title="Numbered list (toggle on the selected lines)" onClick={() => runFormat((t, s, e) => toggleList(t, s, e, "number"))}>
+            1. List
+          </button>
         </div>
         <textarea
           ref={textareaRef}
@@ -121,6 +150,33 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
           value={text}
           onChange={(e) => setText(e.target.value)}
         />
+        <div className="attachment-row">
+          <input
+            ref={fileInputRef}
+            type="file"
+            className="attachment-input"
+            onChange={onAttachmentPicked}
+          />
+          {!attachment && (
+            <button type="button" onClick={() => fileInputRef.current?.click()}>
+              📎 Attach file
+            </button>
+          )}
+          {attachment && (
+            <span className="attachment-chip" title={attachment.name}>
+              📎 {attachment.name}
+              <button
+                type="button"
+                className="attachment-remove"
+                title="Remove attachment"
+                onClick={() => setAttachment(null)}
+              >
+                ×
+              </button>
+            </span>
+          )}
+        </div>
+        {attachmentError && <div className="status error">{attachmentError}</div>}
         {status && <div className={"status " + status.kind}>{status.message}</div>}
         <div className="edit-actions">
           <button type="button" onClick={() => setText(row.reply || "")} title="Reset to AI reply">

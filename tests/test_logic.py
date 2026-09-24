@@ -1,7 +1,11 @@
 """Regression tests for this session's work: the ground()/refuses_in_prose()
 salvage logic, exact-id targeting for record_reply, the follow-up
-mechanism, sender identity + near-duplicate detection, and the review
-queue's conversation grouping.
+mechanism, sender identity + near-duplicate detection, the review queue's
+conversation grouping, the end-to-end answering shapes (grounded/ungrounded/
+related-topic through answer() itself, not just ground()), reply-format
+detection (list vs prose), the standalone-question rewrite's fail-safe
+degrade, and the /generate-reply endpoint's dedupe/near-duplicate/routing
+branches.
 
 Run inside the classifier container, where the environment this code
 actually expects (LiteLLM/Chroma reachability, env vars) is already correct:
@@ -14,7 +18,10 @@ Two tiers, run together by default:
 - Unit tests (the majority): no network. A fresh temp sqlite file per test
   case isolates threads.store state; ground()/render()/
   _group_by_conversation() are pure functions exercised directly with
-  synthetic input -- no DB, no model calls.
+  synthetic input; answer()/standalone_question()/generate_reply() are
+  exercised with retrieve()/requests.post()/classify()/rag_answer() mocked
+  out, so the branching logic is tested without a model or Chroma call --
+  no DB, no model calls.
 - Integration tests (class-level `_require_network()` check, each skipped
   with a clear reason if the embedder isn't reachable): is_near_duplicate()
   needs a real bge-m3 call.
@@ -30,19 +37,41 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+import rag.core as rag_core  # noqa: E402
+import threads.context as thread_context_module  # noqa: E402
 from rag.core import (  # noqa: E402
     DUPLICATE_MAX_DISTANCE,
     NO_ANSWER,
+    Answer,
+    Chunk,
+    answer,
     ground,
     is_near_duplicate,
     refuses_in_prose,
 )
+from classifier.core import Result  # noqa: E402
+from rag.core import NO_INFO_REPLY  # noqa: E402
+from rag.format_hint import as_bullets, resolve, wants_list  # noqa: E402
 from threads import context as thread_context  # noqa: E402
 from threads import store as thread_store  # noqa: E402
 from threads.store import Exchange  # noqa: E402
+
+
+def _mock_response(payload: dict) -> mock.Mock:
+    """A requests.Response stand-in for a chat-completion call: .json()
+    returns `payload`, .raise_for_status() is a no-op (the happy path)."""
+    resp = mock.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = payload
+    return resp
+
+
+def _chat_payload(content: str) -> dict:
+    return {"choices": [{"message": {"content": content}}]}
 
 
 def _network_reachable() -> bool:
@@ -147,6 +176,252 @@ class TestGround(unittest.TestCase):
 
 
 # =============================================================================
+# rag.core.answer() -- the end-to-end answering shapes a single enquiry can
+# take, with retrieve() and the chat-completion call mocked out so the gate
+# and grounding logic is exercised without a model or Chroma. Complements
+# TestGround above, which tests ground() directly on hand-written model
+# output; these test answer() as a whole, including the retrieval-distance
+# gate that ground() never sees.
+# =============================================================================
+
+
+class TestAnswerGrounding(unittest.TestCase):
+    def _chunk(self, distance: float, heading: str = "EVH > Level 2") -> Chunk:
+        return Chunk(text="Level 2 body text.", source="evh.docx", heading=heading, distance=distance)
+
+    def test_content_in_docs_is_grounded_with_source(self):
+        """A question the documents answer directly: single query, single
+        prose reply, source attached."""
+        chunk = self._chunk(0.15)
+        with mock.patch.object(rag_core, "retrieve", return_value=[chunk]), \
+             mock.patch.object(
+                 rag_core.requests, "post",
+                 return_value=_mock_response(_chat_payload("Level 2 covers CAN and UDS.")),
+             ):
+            result = answer("What does level 2 cover?")
+        self.assertTrue(result.ok)
+        self.assertTrue(result.grounded)
+        self.assertEqual(result.text, "Level 2 covers CAN and UDS.")
+        self.assertEqual(result.sources, ["EVH > Level 2"])
+
+    def test_content_not_in_docs_is_ungrounded(self):
+        """The model emits the bare refusal token -- content genuinely absent
+        from the corpus, not a retrieval miss."""
+        chunk = self._chunk(0.4)
+        with mock.patch.object(rag_core, "retrieve", return_value=[chunk]), \
+             mock.patch.object(
+                 rag_core.requests, "post",
+                 return_value=_mock_response(_chat_payload(NO_ANSWER)),
+             ):
+            result = answer("What is the CVSS score for a CAN injection attack?")
+        self.assertTrue(result.ok)
+        self.assertFalse(result.grounded)
+        self.assertEqual(result.text, "")
+        self.assertIn("member of our team", result.reply)
+
+    def test_related_topic_answer_salvaged_end_to_end(self):
+        """The model opens with a refusal sentence but real, related-topic
+        content follows -- answer() must salvage it the same way ground()
+        does on its own (see TestGround), not just when called directly."""
+        leading_refusal = (
+            "The documentation does not specify a hardware kit for Level 3. "
+            "Level 2 training includes a dedicated embedded hardware kit "
+            "provided to each participant."
+        )
+        chunk = self._chunk(0.3)
+        with mock.patch.object(rag_core, "retrieve", return_value=[chunk]), \
+             mock.patch.object(
+                 rag_core.requests, "post",
+                 return_value=_mock_response(_chat_payload(leading_refusal)),
+             ):
+            result = answer("What hardware kit does level 3 use?")
+        self.assertTrue(result.grounded)
+        self.assertEqual(
+            result.text,
+            "Level 2 training includes a dedicated embedded hardware kit "
+            "provided to each participant.",
+        )
+
+    def test_no_chunks_retrieved_is_ungrounded_not_an_error(self):
+        with mock.patch.object(rag_core, "retrieve", return_value=[]):
+            result = answer("Do you teach basket weaving?")
+        self.assertTrue(result.ok)
+        self.assertFalse(result.grounded)
+        self.assertEqual(result.chunks, [])
+
+    def test_chunks_past_max_distance_are_ungrounded(self):
+        """Retrieval found something, but nothing close enough -- distinct
+        from the no-chunks-at-all case: `chunks` is populated (so a caller
+        can still log the closest distance) even though nothing was kept."""
+        far_chunks = [self._chunk(1.4), self._chunk(1.8)]
+        with mock.patch.object(rag_core, "retrieve", return_value=far_chunks):
+            result = answer("Unrelated question", max_distance=1.0)
+        self.assertTrue(result.ok)
+        self.assertFalse(result.grounded)
+        self.assertEqual(result.chunks, far_chunks)
+
+    def test_retrieval_failure_is_an_error_not_ungrounded(self):
+        """A failed request says nothing about whether the documents cover
+        the question -- callers must be able to tell this apart from a
+        genuine, successful ungrounded answer (see api.py's /answer, which
+        only records a reply on the ok-but-ungrounded path)."""
+        with mock.patch.object(rag_core, "retrieve", side_effect=RuntimeError("chroma down")):
+            result = answer("What does level 1 cover?")
+        self.assertFalse(result.ok)
+        self.assertFalse(result.grounded)
+        self.assertIn("chroma down", result.error)
+
+    def test_model_request_failure_is_an_error(self):
+        chunk = self._chunk(0.2)
+        with mock.patch.object(rag_core, "retrieve", return_value=[chunk]), \
+             mock.patch.object(
+                 rag_core.requests, "post",
+                 side_effect=rag_core.requests.RequestException("connection refused"),
+             ):
+            result = answer("What does level 1 cover?")
+        self.assertFalse(result.ok)
+        self.assertFalse(result.grounded)
+
+    def test_multi_question_forced_list_coerces_paragraph_into_bullets(self):
+        """Enquirer asked several things (as_list=True, the caller's job --
+        see TestFormatHint) but the small model still answered in one
+        paragraph -- the as_bullets() net inside answer() must split it."""
+        paragraph = (
+            "Level 1 covers the fundamentals of automotive networking. "
+            "Level 2 adds hands-on hardware exercises with a provided kit. "
+            "Level 3 is on-site training using real client ECUs."
+        )
+        chunk = self._chunk(0.2)
+        with mock.patch.object(rag_core, "retrieve", return_value=[chunk]), \
+             mock.patch.object(
+                 rag_core.requests, "post",
+                 return_value=_mock_response(_chat_payload(paragraph)),
+             ):
+            result = answer(
+                "What does each level cover, and how is level 3 different, and "
+                "does level 2 include hardware?",
+                as_list=True,
+            )
+        self.assertTrue(result.grounded)
+        self.assertTrue(result.text.startswith("- "))
+        self.assertEqual(result.text.count("\n- "), 2)  # 3 bullets total
+
+
+# =============================================================================
+# rag.format_hint -- pure functions, no mocking. Decides list vs prose from
+# the enquirer's own wording, and the as_bullets() net that coerces a
+# paragraph the model produced anyway.
+# =============================================================================
+
+
+class TestFormatHint(unittest.TestCase):
+    def test_own_bulleted_list_wants_list(self):
+        self.assertTrue(wants_list("Questions:\n- price?\n- start date?"))
+
+    def test_own_numbered_list_wants_list(self):
+        self.assertTrue(wants_list("1. What is the price?\n2. When does it start?"))
+
+    def test_two_questions_wants_list(self):
+        self.assertTrue(wants_list("What is the price? When does it start?"))
+
+    def test_explicit_ask_for_points_wants_list(self):
+        self.assertTrue(wants_list("Can you break this down for me in points?"))
+
+    def test_set_shaped_question_wants_list(self):
+        self.assertTrue(wants_list("What are the prerequisites for level 2?"))
+
+    def test_plain_single_question_is_prose(self):
+        self.assertFalse(wants_list("What does level 2 cost?"))
+
+    def test_empty_text_is_prose(self):
+        self.assertFalse(wants_list(""))
+
+    def test_resolve_list_mode_forces_list_regardless_of_text(self):
+        self.assertIs(resolve("list", "What does level 2 cost?"), True)
+
+    def test_resolve_prose_mode_forces_prose_regardless_of_text(self):
+        self.assertIs(resolve("prose", "1. a?\n2. b?"), False)
+
+    def test_resolve_auto_defers_to_wants_list(self):
+        self.assertIs(resolve("auto", "What is the price? When does it start?"), True)
+        self.assertIsNone(resolve("auto", "What does level 2 cost?"))
+
+    def test_as_bullets_noop_when_already_a_list(self):
+        text = "- one\n- two"
+        self.assertEqual(as_bullets(text), text)
+
+    def test_as_bullets_noop_when_single_sentence(self):
+        text = "Level 2 costs one thousand dollars."
+        self.assertEqual(as_bullets(text), text)
+
+    def test_as_bullets_splits_multi_sentence_paragraph(self):
+        text = (
+            "Level 1 covers networking fundamentals. Level 2 adds hardware "
+            "exercises. Level 3 is on-site with real ECUs."
+        )
+        out = as_bullets(text)
+        self.assertEqual(out.count("\n- ") + 1, 3)
+        self.assertTrue(out.startswith("- "))
+
+    def test_as_bullets_keeps_short_lead_in_line(self):
+        text = "You will need: A laptop capable of running a VM. A CAN interface for the exercises."
+        out = as_bullets(text)
+        self.assertTrue(out.startswith("You will need:\n- "))
+
+
+# =============================================================================
+# threads.context.standalone_question -- the follow-up rewrite step, mocked
+# at the chat-completion call. Its fail-safe contract matters as much as the
+# happy path: a follow-up must never be dropped or mangled just because the
+# rewrite call failed.
+# =============================================================================
+
+
+class TestStandaloneQuestionRewrite(unittest.TestCase):
+    def test_no_prior_history_skips_rewrite_entirely(self):
+        with mock.patch.object(thread_context_module.requests, "post") as post:
+            out = thread_context.standalone_question("What are the levels?", [])
+        self.assertEqual(out, "What are the levels?")
+        post.assert_not_called()
+
+    def test_follow_up_rewritten_using_prior_context(self):
+        prior = [Exchange(id=1, query="What are the levels?", reply="Three levels.")]
+        with mock.patch.object(
+            thread_context_module.requests, "post",
+            return_value=_mock_response(
+                _chat_payload("What does the second level cover?")
+            ),
+        ):
+            out = thread_context.standalone_question("And the second one?", prior)
+        self.assertEqual(out, "What does the second level cover?")
+
+    def test_rewrite_call_failure_degrades_to_original_text(self):
+        """The rewrite is an enhancement, not a requirement -- a thread that
+        cannot reach the model must still produce a draft from the raw
+        (if under-specified) question rather than fail the email."""
+        prior = [Exchange(id=1, query="What are the levels?", reply="Three levels.")]
+        with mock.patch.object(
+            thread_context_module.requests, "post",
+            side_effect=thread_context_module.requests.RequestException("timeout"),
+        ):
+            out = thread_context.standalone_question("And the second one?", prior)
+        self.assertEqual(out, "And the second one?")
+
+    def test_rewrite_that_answers_instead_of_rewriting_is_discarded(self):
+        """A rewrite far longer than the original is the model having padded
+        or answered the question rather than condensed it -- the original is
+        safer to embed than an invented one."""
+        prior = [Exchange(id=1, query="What are the levels?", reply="Three levels.")]
+        bloated = "Well, " * 200 + "what does the second level cover?"
+        with mock.patch.object(
+            thread_context_module.requests, "post",
+            return_value=_mock_response(_chat_payload(bloated)),
+        ):
+            out = thread_context.standalone_question("And the second one?", prior)
+        self.assertEqual(out, "And the second one?")
+
+
+# =============================================================================
 # threads.store -- exact-id targeting, follow-ups, sender identity.
 # Each test gets its own temp sqlite file so nothing leaks between cases.
 # =============================================================================
@@ -242,6 +517,25 @@ class TestRecordInboundAndReply(StoreTestCase):
         self.assertEqual(third_row["reply"], "Yes, 10% early-bird.")
         self.assertIsNone(stuck_row["reply"])  # never touched
 
+    def test_mark_sent_stores_attachment_name(self):
+        """Only the filename crosses into storage -- api.py never passes the
+        attachment's bytes here, and mark_sent has nowhere to put them even
+        if it did (no such column). See attachment_name's comment on
+        _ADDED_COLUMNS."""
+        exchange_id = thread_store.record_inbound("conv-1", "q", path=self.db_path)
+        thread_store.record_reply("conv-1", "a", path=self.db_path)
+        thread_store.mark_sent(
+            exchange_id, "a", attachment_name="notes.pdf", path=self.db_path
+        )
+        row = thread_store.get_exchange(exchange_id, path=self.db_path)
+        self.assertEqual(row["attachment_name"], "notes.pdf")
+
+    def test_mark_sent_without_attachment_leaves_it_null(self):
+        exchange_id = thread_store.record_inbound("conv-1", "q", path=self.db_path)
+        thread_store.mark_sent(exchange_id, "a", path=self.db_path)
+        row = thread_store.get_exchange(exchange_id, path=self.db_path)
+        self.assertIsNone(row["attachment_name"])
+
 
 class TestFollowups(StoreTestCase):
     def test_create_followup_is_a_placeholder_not_a_real_query(self):
@@ -296,6 +590,99 @@ class TestFollowups(StoreTestCase):
         row_b = thread_store.get_exchange(stage_b, path=self.db_path)
         self.assertEqual(row_a["reply"], "reply for A")
         self.assertIsNone(row_b["reply"])  # independent -- no chaining coupling
+
+
+class TestReplyAttachment(unittest.TestCase):
+    """The review edit box's one-file attachment (see lib/attachment.js):
+    only the filename is ever meant to survive on this side -- these guard
+    the size cap, the Graph payload shape, and that a small file round-trips
+    unmodified through base64 into Graph's fileAttachment dict."""
+
+    def test_over_limit_rejected(self):
+        from mail.graph import Attachment, AttachmentTooLarge, MAX_ATTACHMENT_BYTES
+
+        with self.assertRaises(AttachmentTooLarge):
+            Attachment(
+                name="big.bin",
+                content_type="application/octet-stream",
+                content_bytes=b"x" * (MAX_ATTACHMENT_BYTES + 1),
+            )
+
+    def test_at_limit_accepted(self):
+        from mail.graph import Attachment, MAX_ATTACHMENT_BYTES
+
+        Attachment(
+            name="exact.bin",
+            content_type="application/octet-stream",
+            content_bytes=b"x" * MAX_ATTACHMENT_BYTES,
+        )  # must not raise
+
+    def test_as_graph_dict_round_trips_bytes(self):
+        import base64
+
+        from mail.graph import Attachment
+
+        att = Attachment(name="a.txt", content_type="text/plain", content_bytes=b"hello")
+        d = att.as_graph_dict()
+        self.assertEqual(d["@odata.type"], "#microsoft.graph.fileAttachment")
+        self.assertEqual(d["name"], "a.txt")
+        self.assertEqual(d["contentType"], "text/plain")
+        self.assertEqual(base64.b64decode(d["contentBytes"]), b"hello")
+
+    def test_missing_content_type_defaults(self):
+        from mail.graph import Attachment
+
+        d = Attachment(name="a", content_type="", content_bytes=b"x").as_graph_dict()
+        self.assertEqual(d["contentType"], "application/octet-stream")
+
+    def test_send_reply_plain_text_keeps_comment_and_adds_attachment(self):
+        """Plain text (no bold/italic) + an attachment: comment is still sent
+        as-is (quoted thread kept) and the attachment rides in message."""
+        from unittest import mock
+
+        import mail.graph as g
+
+        att = g.Attachment(name="a.txt", content_type="text/plain", content_bytes=b"hi")
+        with mock.patch.object(g, "configured", return_value=True), \
+             mock.patch.object(g, "_access_token", return_value="t"), \
+             mock.patch.object(g.requests, "post") as post:
+            g.send_reply("msg-1", "plain reply", attachment=att)
+            payload = post.call_args.kwargs["json"]
+            self.assertEqual(payload["comment"], "plain reply")
+            self.assertEqual(payload["message"]["attachments"], [att.as_graph_dict()])
+
+    def test_send_reply_formatted_text_keeps_attachment_alongside_body(self):
+        """**bold** + an attachment: message carries both body and attachments
+        in the same dict, no comment (matches the plain bold/italic case)."""
+        from unittest import mock
+
+        import mail.graph as g
+
+        att = g.Attachment(name="a.txt", content_type="text/plain", content_bytes=b"hi")
+        with mock.patch.object(g, "configured", return_value=True), \
+             mock.patch.object(g, "_access_token", return_value="t"), \
+             mock.patch.object(g.requests, "post") as post:
+            g.send_reply("msg-1", "**bold**", attachment=att)
+            payload = post.call_args.kwargs["json"]
+            self.assertNotIn("comment", payload)
+            self.assertEqual(payload["message"]["attachments"], [att.as_graph_dict()])
+            self.assertEqual(
+                payload["message"]["body"],
+                {"contentType": "HTML", "content": "<p><strong>bold</strong></p>"},
+            )
+
+    def test_send_reply_no_attachment_has_no_message_key_for_plain_text(self):
+        """Regression guard: adding attachment support must not start sending
+        an empty `message` key on the ordinary plain-text, no-attachment path."""
+        from unittest import mock
+
+        import mail.graph as g
+
+        with mock.patch.object(g, "configured", return_value=True), \
+             mock.patch.object(g, "_access_token", return_value="t"), \
+             mock.patch.object(g.requests, "post") as post:
+            g.send_reply("msg-1", "plain")
+            self.assertEqual(post.call_args.kwargs["json"], {"comment": "plain"})
 
 
 class TestSenderIdentity(StoreTestCase):
@@ -563,6 +950,20 @@ class TestReplyHtml(unittest.TestCase):
             "<p><strong>Hi</strong><br>line two</p><p>Second para</p>",
         )
 
+    def test_lists_render_as_ul_and_ol_alongside_formatting(self):
+        from mail.graph import reply_html
+
+        self.assertEqual(
+            reply_html("Intro **now**\n- one\n- *two*\n\n1. first\n2. second\nafter"),
+            "<p>Intro <strong>now</strong></p><ul><li>one</li><li><em>two</em></li></ul>"
+            "<ol><li>first</li><li>second</li></ol><p>after</p>",
+        )
+
+    def test_list_alone_stays_plain_text(self):
+        from mail.graph import reply_html
+
+        self.assertIsNone(reply_html("- one\n- two\n\n1. a\n2. b"))
+
     def test_send_reply_payload_shape(self):
         from unittest import mock
 
@@ -578,6 +979,146 @@ class TestReplyHtml(unittest.TestCase):
                 post.call_args.kwargs["json"],
                 {"message": {"body": {"contentType": "HTML", "content": "<p><strong>bold</strong></p>"}}},
             )
+
+
+# =============================================================================
+# api.generate_reply() -- the Outlook path's gate/dedupe/routing branches,
+# with classify() and rag_answer() mocked out (no model, no Chroma) so this
+# tests the endpoint's own branching, not the model's judgement. Real
+# threads.store, pointed at a temp sqlite file per test.
+# =============================================================================
+
+_RAG_ROUTE_RESULT = Result(
+    flags={"academic": True, "administrative": False, "spam": False},
+    probs={"academic": 0.95, "administrative": 0.0, "spam": 0.0},
+)
+_HUMAN_ROUTE_RESULT = Result(
+    flags={"academic": True, "administrative": True, "spam": False},
+    probs={"academic": 0.95, "administrative": 0.95, "spam": 0.0},
+)
+
+
+class GenerateReplyFlowTestCase(unittest.TestCase):
+    def setUp(self):
+        try:
+            import api as api_module
+        except Exception as exc:  # pragma: no cover - environment-dependent
+            raise unittest.SkipTest(f"api.py not importable here: {exc}")
+        self.api = api_module
+
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self.db_path = pathlib.Path(self._tmp.name)
+        self._orig_db_path = thread_store.DB_PATH
+        thread_store.DB_PATH = self.db_path
+
+    def tearDown(self):
+        thread_store.DB_PATH = self._orig_db_path
+        self.db_path.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm"):
+            pathlib.Path(str(self.db_path) + suffix).unlink(missing_ok=True)
+
+    def _request(self, **overrides):
+        fields = {
+            "email_text": "What are the levels?",
+            "is_html": False,
+            "conversation_id": "conv-1",
+            "subject": "Enquiry",
+        }
+        fields.update(overrides)
+        return self.api.ReplyRequest(**fields)
+
+    def test_duplicate_message_id_produces_no_second_draft(self):
+        grounded = Answer(
+            text="Three levels.", grounded=True,
+            chunks=[Chunk(text="x", source="s", heading="h", distance=0.1)],
+        )
+        with mock.patch.object(self.api, "classify", return_value=_RAG_ROUTE_RESULT), \
+             mock.patch.object(self.api, "rag_answer", return_value=grounded) as rag_mock:
+            first = self.api.generate_reply(self._request(message_id="m1"))
+            second = self.api.generate_reply(self._request(message_id="m1"))
+
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(first["answered"])
+
+        self.assertTrue(second["duplicate"])
+        self.assertFalse(second["answered"])
+        self.assertEqual(second["reason"], "already handled (duplicate message_id)")
+        rag_mock.assert_called_once()  # never reached on the duplicate
+
+    def test_near_duplicate_blocks_second_draft_without_reaching_rag(self):
+        """First email is routed to a human and so stays unanswered
+        (`reply IS NULL`) -- the exact condition that makes it `pending` for
+        the near-duplicate check on the second email."""
+        with mock.patch.object(self.api, "classify", return_value=_HUMAN_ROUTE_RESULT):
+            first = self.api.generate_reply(
+                self._request(email_text="Why hasn't my invoice been refunded?", message_id="m1")
+            )
+        self.assertEqual(first["reason"], "not routed to rag")
+
+        with mock.patch.object(self.api, "classify", return_value=_RAG_ROUTE_RESULT), \
+             mock.patch.object(self.api, "is_near_duplicate", return_value=True), \
+             mock.patch.object(self.api, "rag_answer") as rag_mock:
+            second = self.api.generate_reply(
+                self._request(email_text="Any update on my refund?", message_id="m2")
+            )
+
+        self.assertTrue(second["near_duplicate"])
+        self.assertFalse(second["answered"])
+        self.assertEqual(
+            second["reason"],
+            "near-duplicate of a still-unanswered question in this thread",
+        )
+        rag_mock.assert_not_called()
+
+    def test_not_routed_to_rag_produces_no_draft_and_skips_rag_answer(self):
+        with mock.patch.object(self.api, "classify", return_value=_HUMAN_ROUTE_RESULT), \
+             mock.patch.object(self.api, "rag_answer") as rag_mock:
+            payload = self.api.generate_reply(
+                self._request(email_text="Please refund my last payment.", message_id="m1")
+            )
+        self.assertFalse(payload["answered"])
+        self.assertEqual(payload["reason"], "not routed to rag")
+        rag_mock.assert_not_called()
+
+    def test_grounded_reply_is_recorded_to_the_thread(self):
+        grounded = Answer(
+            text="Three levels: 1, 2 and 3.",
+            grounded=True,
+            chunks=[Chunk(text="x", source="s", heading="EVH > Overview", distance=0.1)],
+        )
+        with mock.patch.object(self.api, "classify", return_value=_RAG_ROUTE_RESULT), \
+             mock.patch.object(self.api, "rag_answer", return_value=grounded):
+            payload = self.api.generate_reply(self._request(message_id="m1"))
+
+        self.assertTrue(payload["answered"])
+        self.assertEqual(payload["answer"], "Three levels: 1, 2 and 3.")
+        exchanges = thread_store.history(payload["conversation_id"])
+        self.assertEqual(len(exchanges), 1)
+        self.assertTrue(exchanges[0].grounded)
+        self.assertIn("Three levels", exchanges[0].reply)
+
+    def test_ungrounded_reply_is_still_recorded_so_the_thread_shows_it(self):
+        """A no-information draft is a real reply the enquirer will have
+        seen -- it must land in the thread even though `answered` is False,
+        so a later follow-up doesn't read as though the question vanished."""
+        ungrounded = Answer(
+            text="",
+            grounded=False,
+            chunks=[Chunk(text="x", source="s", heading="h", distance=0.5)],
+        )
+        with mock.patch.object(self.api, "classify", return_value=_RAG_ROUTE_RESULT), \
+             mock.patch.object(self.api, "rag_answer", return_value=ungrounded):
+            payload = self.api.generate_reply(
+                self._request(email_text="What is the CVSS score for a CAN attack?", message_id="m1")
+            )
+
+        self.assertFalse(payload["answered"])
+        self.assertEqual(payload["reason"], "no grounded answer in the documents")
+        exchanges = thread_store.history(payload["conversation_id"])
+        self.assertEqual(len(exchanges), 1)
+        self.assertFalse(exchanges[0].grounded)
+        self.assertIn(NO_INFO_REPLY, exchanges[0].reply)
 
 
 if __name__ == "__main__":

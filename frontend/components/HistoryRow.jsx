@@ -54,6 +54,9 @@ export default function HistoryRow({ row }) {
 
       <div className="col">
         {wasEdited && <div className="edited-note">Edited before sending</div>}
+        {row.attachment_name && (
+          <div className="edited-note">📎 {row.attachment_name}</div>
+        )}
         <ClampedText text={row.edited_reply || row.reply || ""} />
       </div>
     </div>

@@ -20,6 +20,8 @@ do anything else Mail.Send doesn't require.
 
 from __future__ import annotations
 
+import base64
+import dataclasses
 import html
 import os
 import re
@@ -93,28 +95,117 @@ _BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _ITALIC_RE = re.compile(r"(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])")
 
 
+_BULLET_RE = re.compile(r"^- (.*)$")
+_NUMBER_RE = re.compile(r"^\d+\. (.*)$")
+
+
+def _block_html(block: str) -> str:
+    """One blank-line-separated block: consecutive "- " lines become a <ul>,
+    "1. " lines an <ol>, anything else a <p> with <br> between its lines."""
+    out: list[str] = []
+    run_tag: str | None = None
+    run: list[str] = []
+
+    def flush() -> None:
+        nonlocal run_tag, run
+        if not run:
+            return
+        if run_tag == "p":
+            out.append("<p>" + "<br>".join(run) + "</p>")
+        else:
+            items = "".join(f"<li>{item}</li>" for item in run)
+            out.append(f"<{run_tag}>{items}</{run_tag}>")
+        run_tag, run = None, []
+
+    for line in block.split("\n"):
+        if m := _BULLET_RE.match(line):
+            tag, value = "ul", m.group(1)
+        elif m := _NUMBER_RE.match(line):
+            tag, value = "ol", m.group(1)
+        else:
+            tag, value = "p", line
+        if tag != run_tag:
+            flush()
+            run_tag = tag
+        run.append(value)
+    flush()
+    return "".join(out)
+
+
 def reply_html(text: str) -> str | None:
     """Render the reviewer's **bold** / *italic* markers as an HTML body.
 
-    Returns None when the text has no formatting, so the caller can keep
-    sending the plain `comment` (which Graph places above the quoted
-    original thread) for the ordinary case.
+    "- " / "1. " lines render as real lists in the same pass. Returns None
+    when the text has no bold/italic, so the caller keeps sending the plain
+    `comment` (which Graph places above the quoted original thread): a list
+    on its own already reads fine as plain text, so it is not worth dropping
+    the quoted thread for.
     """
     escaped = html.escape(text, quote=False)
     formatted = _ITALIC_RE.sub(r"<em>\1</em>", _BOLD_RE.sub(r"<strong>\1</strong>", escaped))
     if formatted == escaped:
         return None
-    paragraphs = [p.replace("\n", "<br>") for p in re.split(r"\n\s*\n", formatted.strip())]
-    return "".join(f"<p>{p}</p>" for p in paragraphs)
+    return "".join(_block_html(b) for b in re.split(r"\n\s*\n", formatted.strip()))
 
 
-def send_reply(message_ref: str, comment: str, *, timeout: int = 30) -> None:
+# Graph rejects a fileAttachment's contentBytes over ~3MB on this same-call
+# path (anything bigger needs a chunked upload session, which is a different,
+# much bigger feature). Checked against the decoded size, not the base64
+# text, which runs about a third larger than the bytes it encodes.
+MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024
+
+
+class AttachmentTooLarge(RuntimeError):
+    """A supplied attachment exceeds MAX_ATTACHMENT_BYTES."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Attachment:
+    """One reviewer-supplied file, decoded and ready for Graph.
+
+    Deliberately just a name and bytes passed straight through in one
+    request -- see attachment_name's comment in threads/store.py for what
+    this app does and does not persist.
+    """
+
+    name: str
+    content_type: str
+    content_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if len(self.content_bytes) > MAX_ATTACHMENT_BYTES:
+            raise AttachmentTooLarge(
+                f"attachment is {len(self.content_bytes)} bytes, "
+                f"over the {MAX_ATTACHMENT_BYTES} byte limit"
+            )
+
+    def as_graph_dict(self) -> dict:
+        return {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": self.name,
+            "contentType": self.content_type or "application/octet-stream",
+            "contentBytes": base64.b64encode(self.content_bytes).decode("ascii"),
+        }
+
+
+def send_reply(
+    message_ref: str,
+    comment: str,
+    *,
+    attachment: Attachment | None = None,
+    timeout: int = 30,
+) -> None:
     """Send `comment` as a reply to `message_ref` (a Graph message id) now.
 
     Plain text goes as Graph's `comment`. If it carries **bold** / *italic*
-    markers it goes as an HTML `message.body` instead (Graph rejects sending
+    markers (lists included) it goes as an HTML `message.body` instead (Graph rejects sending
     both) -- with the trade-off that a supplied body replaces the whole
     reply body, so the quoted earlier thread is not appended in that case.
+
+    `attachment`, if given, rides in `message.attachments` regardless of
+    which body shape above was chosen -- Graph's reply action accepts
+    `message` and `comment` together, so attaching a file never costs the
+    quoted thread the way bold/italic does.
 
     Raises GraphNotConfigured if the app registration is not set up yet, and
     GraphSendError on anything Graph itself rejects -- this never returns a
@@ -131,11 +222,16 @@ def send_reply(message_ref: str, comment: str, *, timeout: int = 30) -> None:
         raise GraphSendError("no Graph message id (ref) stored for this exchange")
 
     body_html = reply_html(comment)
-    payload = (
-        {"message": {"body": {"contentType": "HTML", "content": body_html}}}
-        if body_html is not None
-        else {"comment": comment}
-    )
+    message: dict = {}
+    payload: dict = {}
+    if body_html is not None:
+        message["body"] = {"contentType": "HTML", "content": body_html}
+    else:
+        payload["comment"] = comment
+    if attachment is not None:
+        message["attachments"] = [attachment.as_graph_dict()]
+    if message:
+        payload["message"] = message
 
     try:
         token = _access_token(timeout=timeout)

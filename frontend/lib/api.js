@@ -25,11 +25,20 @@ export async function fetchHistory() {
   return data.history || [];
 }
 
-export async function sendReply(id, reply) {
+// `attachment`, if given, is { name, contentType, base64 } from
+// lib/attachment.js's readFileAsAttachment -- one file, already read and
+// size-checked client-side.
+export async function sendReply(id, reply, attachment) {
+  const body = { reply };
+  if (attachment) {
+    body.attachment_name = attachment.name;
+    body.attachment_content_type = attachment.contentType;
+    body.attachment_content_b64 = attachment.base64;
+  }
   const res = await fetch(`${BASE}/${id}/send`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ reply }),
+    body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);

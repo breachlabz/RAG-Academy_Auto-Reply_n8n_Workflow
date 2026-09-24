@@ -57,3 +57,40 @@ export function wrapSelection(text, selectionStart, selectionEnd, marker) {
     selectionEnd: selectionStart + marker.length + selected.length,
   };
 }
+
+// Bullet ("- ") / numbered ("1. ") list toggle over every line the selection
+// touches (the cursor's own line when nothing is selected). Blank lines are
+// left alone and don't consume a number. If every non-blank line already has
+// this kind of prefix it is removed instead; a line with the *other* kind is
+// converted. The prefixes are plain text on purpose, so a list reads fine
+// even in a plain-text email; mail/graph.py's reply_html renders the same
+// syntax as <ul>/<ol> when the reply goes out as HTML -- keep the two in sync.
+const LIST_PREFIX = /^(?:- |\d+\. )/;
+
+export function toggleList(text, selectionStart, selectionEnd, kind) {
+  const start = text.lastIndexOf("\n", selectionStart - 1) + 1;
+  let end = text.indexOf("\n", selectionEnd);
+  if (end === -1) end = text.length;
+
+  const lines = text.slice(start, end).split("\n");
+  const own = kind === "number" ? /^\d+\. / : /^- /;
+  const content = lines.filter((l) => l.trim() !== "");
+  const remove = content.length > 0 && content.every((l) => own.test(l));
+
+  let n = 0;
+  const changed = lines
+    .map((line) => {
+      if (line.trim() === "") return line;
+      const bare = line.replace(LIST_PREFIX, "");
+      if (remove) return bare;
+      n += 1;
+      return (kind === "number" ? `${n}. ` : "- ") + bare;
+    })
+    .join("\n");
+
+  return {
+    text: text.slice(0, start) + changed + text.slice(end),
+    selectionStart: start,
+    selectionEnd: start + changed.length,
+  };
+}

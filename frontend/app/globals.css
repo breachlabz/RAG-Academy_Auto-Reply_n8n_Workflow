@@ -172,8 +172,9 @@ button.link:hover { color: var(--text); }
 .edit-cell { display: flex; flex-direction: column; }
 .edit-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: auto; padding-top: 10px; }
 
-/* Plain-text selection transforms above the edit box -- see lib/textFormat
-   for why Bold/Italic are markers, not real formatting. */
+/* Selection transforms above the edit box -- markers/prefixes on the plain
+   text here, turned into real HTML (bold/italic/lists) by mail/graph.py's
+   reply_html when the reply is sent. See lib/textFormat. */
 .format-toolbar { display: flex; align-items: center; gap: 4px; margin-bottom: 6px; }
 .format-toolbar button {
   padding: 3px 8px;
@@ -195,6 +196,41 @@ button.link:hover { color: var(--text); }
   margin-top: 4px;
   line-height: 1.4;
 }
+/* File input is visually replaced by the "Attach file" button -- the native
+   control stays in the DOM (for click() and onChange) but off-screen, not
+   display:none, so it keeps working in every browser. */
+.attachment-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+}
+.attachment-row { margin-top: 6px; }
+.attachment-row button {
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  font-size: 11px;
+  max-width: 100%;
+}
+.attachment-remove {
+  border: none;
+  background: none;
+  padding: 0 2px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--muted-2);
+}
+.attachment-remove:hover { color: var(--danger); }
 textarea {
   width: 100%;
   min-height: 6.5em;
@@ -332,14 +368,7 @@ section + section { margin-top: 64px; }
   font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: r { background: #3a3010; color: #f0d878; border-color: #5c4a17; }
-}
-header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 22px; flex-wrap: wrap; }
-h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
-.count { color: var(--muted); font-size: 12px; }
-.toolbar { display: flex; gap: 10px; align-items: center; }
-
-button {.04em;
+  letter-spacing: .04em;
   color: var(--muted-2);
   margin-bottom: 6px;
 }

@@ -49,6 +49,8 @@ In compose:   see docker-compose.yml (talks to the chat model and chroma by name
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import pathlib
 
@@ -729,9 +731,19 @@ def process_followups() -> dict:
 
 
 class SendReplyRequest(BaseModel):
-    """`/review/{id}/send` -- the reviewer's final text for one exchange."""
+    """`/review/{id}/send` -- the reviewer's final text for one exchange.
+
+    The three attachment_* fields are all optional and all-or-nothing (one
+    file, see mail.graph.Attachment). content_b64 is the file read client-side
+    with FileReader -- it lives in this request only: review_send passes the
+    decoded bytes straight to mail_graph.send_reply and never writes them to
+    disk or the DB, only attachment_name survives, onto the row's history.
+    """
 
     reply: str
+    attachment_name: str | None = None
+    attachment_content_type: str | None = None
+    attachment_content_b64: str | None = None
 
 
 @app.get("/review")
@@ -845,15 +857,35 @@ def review_send(exchange_id: int, req: SendReplyRequest) -> dict:
     if not reply:
         raise HTTPException(422, "reply cannot be empty")
 
+    # Decoded here, right before use, rather than kept on `req` any longer
+    # than necessary -- the bytes exist only for the one Graph call below and
+    # are never written anywhere; only attachment.name reaches mark_sent.
+    attachment = None
+    if req.attachment_name:
+        try:
+            content_bytes = base64.b64decode(req.attachment_content_b64 or "", validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(422, f"attachment is not valid base64: {exc}") from exc
+        try:
+            attachment = mail_graph.Attachment(
+                name=req.attachment_name,
+                content_type=req.attachment_content_type or "",
+                content_bytes=content_bytes,
+            )
+        except mail_graph.AttachmentTooLarge as exc:
+            raise HTTPException(413, str(exc)) from exc
+
     if not REVIEW_DRY_RUN:
         try:
-            mail_graph.send_reply(row["ref"], reply)
+            mail_graph.send_reply(row["ref"], reply, attachment=attachment)
         except mail_graph.GraphNotConfigured as exc:
             raise HTTPException(503, str(exc)) from exc
         except mail_graph.GraphSendError as exc:
             raise HTTPException(502, str(exc)) from exc
 
-    thread_store.mark_sent(exchange_id, reply)
+    thread_store.mark_sent(
+        exchange_id, reply, attachment_name=req.attachment_name or None
+    )
 
     # Resume the n8n execution that's been paused (Wait node, webhook resume)
     # since Record reply, if this exchange came from that workflow. Best
