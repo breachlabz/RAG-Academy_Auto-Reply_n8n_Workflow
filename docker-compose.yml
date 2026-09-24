@@ -180,6 +180,11 @@ services:
       #   ssh -L 5678:127.0.0.1:5678 <this-host>
       # then open http://localhost:5678
       - "127.0.0.1:5678:5678"
+    # Same as the classifier: the AI Agent's chat-model credential reaches a
+    # model server on this host at http://host.docker.internal:<port>/v1.
+    # Linux Docker does not define that name unless it is mapped here.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - n8n_data:/home/node/.n8n
     networks:

@@ -1,686 +1,694 @@
 # Academy Auto-Reply
 
-An assistant that watches an Outlook mailbox and, for each incoming email:
+Watches an Outlook mailbox and, for each incoming email:
 
-1. **Classifies** it as *academic* or *non-academic* (payments, records,
-   account issues, spam — anything that is not an academic question).
-2. For academic-only email, **retrieves** the relevant passages from a set of
-   Word documents about the training programmes and **drafts a reply grounded
-   in them** — nothing else.
-3. Queues that reply in the **review page** (`/review`) for a human to read,
-   optionally edit, and send. Nothing goes out until a person clicks Send.
+1. **Classifies** it as `academic` (course content, levels, exams, schedules,
+   course prices) or `non_academic` (invoices, refunds, enrolment records,
+   account issues, spam — anything else).
+2. For confident academic-only email, **retrieves** passages from the training
+   documents in `data/docs/` and **drafts a reply grounded only in them**.
+3. Queues the draft on the **review page** (`/review`). A person reads, edits
+   and sends it. **Nothing is sent automatically.**
 
-Anything about payments, records, refunds or account issues — and anything the
-classifier is not confident about, or that the documents do not answer — gets
-**no draft** and is left for a human. **Nothing sends automatically.** Every
-reply this system produces waits in the review queue for an explicit human
-Send.
+Non-academic email, anything the classifier is unsure about, and anything the
+documents don't answer get no draft and are left for a person.
 
-This is the single reference for deploying and running it. Follow it top to
-bottom.
+This file is the single reference for deploying, operating and changing the
+system.
 
 ---
 
-## 1. How it works
+## Contents
+
+1. [Architecture](#1-architecture)
+2. [Requirements](#2-requirements)
+3. [Host preparation](#3-host-preparation)
+4. [Chat model](#4-chat-model)
+5. [Install and configure](#5-install-and-configure)
+6. [Microsoft 365 app registrations](#6-microsoft-365-app-registrations)
+7. [n8n workflow](#7-n8n-workflow)
+8. [Go-live verification](#8-go-live-verification)
+9. [Operations](#9-operations)
+10. [Troubleshooting](#10-troubleshooting)
+11. [HTTP API](#11-http-api)
+12. [Security model and guarantees](#12-security-model-and-guarantees)
+13. [Design notes](#13-design-notes)
+14. [Evaluation](#14-evaluation)
+15. [Repository layout](#15-repository-layout)
+
+---
+
+## 1. Architecture
 
 ```
-                    ┌───────────────────── this docker compose ─────────────────────┐
-                    │                                                               │
-  Outlook mailbox ──┼──▶ n8n ──▶ classifier API ──┬──▶ chromadb   (vector store)    │
-                    │            (FastAPI :8100)  └──▶ embedder   (bge-m3, CPU)      │
-                    │              │        ▲                                        │
-                    │              │        │  the n8n AI Agent node also retrieves  │
-                    │              ▼        │  + drafts, via its own Chroma tool     │
-                    │      review queue                                              │
-                    │      (/review, a human reads/edits/sends)                      │
-                    └──────────────┼────────┼───────────────────────────────────────┘
-                                   │        │
-                                   ▼        ▼
-                    Microsoft Graph      your chat model  (LiteLLM or Ollama)
-                    (app-only, Send)          already running, elsewhere
-                                   │
-                                   ▼
-                            Outlook mailbox (sent)
+                    ┌──────────────────────── docker compose (this repo) ────────────────────────┐
+                    │                                                                            │
+  Outlook mailbox ──┼──▶ n8n ──▶ classifier API ──┬──▶ local_chromadb  (vector store, :8000)      │
+   (Graph, read)    │            (FastAPI :8100)  └──▶ embedder        (bge-m3, CPU)             │
+                    │              │     ▲   the n8n AI Agent retrieves from the same Chroma     │
+                    │              ▼     │                                                       │
+                    │      /review + Knowledge tab  (human approves every send)                  │
+                    └──────────────┼─────┼────────────────────────────────────────────────────────┘
+                                   │     │
+                                   ▼     ▼
+                   Microsoft Graph        chat model server (OpenAI-compatible,
+                   (app-only Mail.Send)   llama.cpp / LiteLLM / Ollama — §4)
 ```
 
-Four containers come up: `n8n`, `classifier`, `chromadb`, `embedder`. All
-publish on `127.0.0.1` only. The **chat model is yours** — an existing LiteLLM
-or Ollama endpoint named once in `.env`; this project adds no model of its own
-and needs no GPU. It runs one small CPU embedding model (`bge-m3`) locally.
-Sending is a separate, app-only Microsoft Graph credential the review page
-calls directly (§6e) — independent of the n8n Outlook connection, which only
-needs to *read* the mailbox now.
+| Container | Image / build | Published | State |
+|---|---|---|---|
+| `email-classifier-api` | `Dockerfile` (FastAPI + static Next.js review UI) | `127.0.0.1:8100` | `./data` bind mount (`threads.db`) |
+| `email-classifier-chroma` | `chromadb/chroma:1.5.9` | `127.0.0.1:8011` | volume `chroma-data` |
+| `email-classifier-embedder` | `text-embeddings-inference:cpu-1.5` (bge-m3) | — | volume `embed-cache` |
+| `n8n` | `n8nio/n8n` | `127.0.0.1:5678` | volume `n8n_data` |
 
-### The pipeline, node by node
+Nothing is published beyond loopback. The chat model runs outside the stack.
 
-The n8n workflow `Academy Agent (Outlook)` is thin plumbing over the classifier
-API. The safety logic (the gate, the refusal detection, the email shell) lives
-in the API and only there.
+### Pipeline
 
 ```
-New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Agent ─▶ Finalize ─▶ Grounded answer? ─true─▶ Record reply
- (polls inbox/min)   POST         ($json.proceed)          (drafts from    POST        ($json.grounded)      POST
-                     /emails/                               academy_docs)  /emails/                          /threads/reply
-                     prepare                                               finalize                          (queues it for
-                                   └─false─▶ Do nothing                    └──────────────false─▶ Human queue  /review)
+New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Agent ─▶ Finalize ─▶ Grounded answer? ─true─▶ Record reply ─▶ Wait for review
+ (polls every min)   POST          ($json.proceed)          (academy_docs  POST        ($json.grounded)      POST
+                     /emails/prepare                         Chroma tool)  /emails/finalize                  /threads/reply
+                                   └─false─▶ Do nothing                                └─false─▶ Human queue
 ```
 
-The workflow's last node is **Record reply** — n8n's job ends once the reply is
-recorded. A human takes it from there at **`/review`** (§6e): read it, edit it
-if needed, click **Send**. That call goes straight from the classifier API to
-Microsoft Graph, not back through n8n.
-
-| Node | Does |
+| Node | Responsibility |
 |---|---|
-| **Prepare** → `POST /emails/prepare` | strips HTML + quoted history, records the inbound message (deduplicated on `internetMessageId`), loads the thread, runs the **classifier gate**, and rewrites a follow-up into a standalone retrieval question. Returns `proceed` (the gate), `history` / `email_text` / `query` / `format` (the agent's prompt), and `ref` (the Graph message id, carried onto the stored row for `/review` to reply to later). |
-| **Is label "Academy"?** | branches on `proceed`. False → *Do nothing* (payments, spam, low confidence, or a duplicate). |
-| **AI Agent — generate reply** | an n8n LangChain agent with the `academy_docs` Chroma tool. Must search the docs before answering; replies with the bare token `NOT_IN_DOCUMENTS` when they do not cover the question. Uses `format` to pick a bulleted or prose reply. Writes the body only — no greeting or sign-off. |
-| **Finalize** → `POST /emails/finalize` | runs the agent's output through the grounding net (rejects a bare/embedded `NOT_IN_DOCUMENTS` and prose that merely *reports the documents as silent*), then wraps a grounded body in the greeting/sign-off shell. Returns `grounded` and the ready-to-send `reply`. |
-| **Grounded answer?** | branches on `grounded`. False → *Human queue*. |
-| **Record reply** → `POST /threads/reply` | records the drafted reply against the conversation (so the next email in the thread has its history) and puts the row in the **review queue** — it now sits at `/review` until a human sends it. |
+| **Prepare** → `/emails/prepare` | Strips HTML and quoted history, records the inbound message (deduplicated on `internetMessageId`), loads the thread, runs the **classifier gate**, rewrites a follow-up into a standalone query. Returns `proceed`, the agent prompt fields and `ref` (Graph message id). |
+| **Is label "Academy"?** | Branches on `proceed`. False → *Do nothing* (non-academic, low confidence, duplicate). |
+| **AI Agent** | Searches `academy_docs` and drafts the body, or returns `NOT_IN_DOCUMENTS`. |
+| **Finalize** → `/emails/finalize` | Grounding net (rejects `NOT_IN_DOCUMENTS` and prose that only reports the documents as silent), wraps the body in greeting/sign-off. |
+| **Record reply** → `/threads/reply` | Stores the draft on the thread and queues it at `/review`. |
+| **Wait for review** | Paused until `/review/{id}/send` resumes it. |
+
+The safety logic (gate, grounding, email shell) lives in the API only; the
+workflow is plumbing. Sending happens from the API straight to Graph when a
+reviewer clicks Send.
 
 ---
 
-## 2. Prerequisites
+## 2. Requirements
 
-| Requirement | Detail |
+| Item | Requirement |
 |---|---|
-| Linux host with **Docker** + **Docker Compose v2** | `docker compose version` prints v2.x |
-| ~8 GB free disk | model cache + images |
-| Your **chat model** on an OpenAI-compatible endpoint (LiteLLM or Ollama), **reachable from a container** | see §3 and §5 |
-| A **Microsoft Entra (Azure AD) app registration** you can create | for the Outlook connection — §6 |
-| The mailbox account | whose inbox this watches |
-
-A capable instruction model is expected for `CHAT_MODEL` — it is used for
-**both** classification and drafting. A ~27B-class model is the reference; a 9B
-works with more misses. See §5 for the hard requirements.
+| OS | Linux x86_64 (Ubuntu 22.04/24.04 LTS assumed below) |
+| Docker | Engine ≥ 24 with Compose v2 |
+| CPU / RAM | 8 vCPU, 32 GB RAM recommended (embedder + API + n8n ≈ 6 GB; rest for the model host if co-located) |
+| Disk | ≥ 60 GB free if the model is hosted here (weights ≈ 20 GB), otherwise ≥ 15 GB |
+| GPU (if hosting the model) | NVIDIA, ≥ 24 GB VRAM for a 32B Q4 model; 16 GB for 14B |
+| Chat model | OpenAI-compatible endpoint with **token logprobs**, **JSON-schema decoding**, **no reasoning output**, context ≥ 8192 — §4 |
+| Network egress | `ghcr.io`, `docker.io`, `huggingface.co`, `login.microsoftonline.com`, `graph.microsoft.com` |
+| Network ingress | SSH only. All service ports are loopback-bound. |
+| Microsoft 365 | Rights to create two app registrations, and a tenant admin for consent — §6 |
+| Repository access | Read access to this repo |
 
 ---
 
-## 3. Bring up the stack
+## 3. Host preparation
+
+Skip the GPU parts if the chat model is hosted elsewhere.
 
 ```sh
-cd email-classifier
-cp .env.example .env
+sudo apt update && sudo apt -y upgrade
+sudo apt -y install ca-certificates curl git jq gnupg
+
+# Docker Engine + Compose v2
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"            # re-login to apply
+docker compose version                     # v2.x
+
+# NVIDIA driver (GPU hosts)
+sudo apt -y install ubuntu-drivers-common && sudo ubuntu-drivers autoinstall && sudo reboot
+nvidia-smi
+
+# NVIDIA Container Toolkit (GPU hosts)
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt update && sudo apt -y install nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 ```
 
-Edit `.env` and set three values:
+If `nvidia-smi` fails after the driver install, Secure Boot is blocking the
+module: disable it or enrol the MOK key.
 
-```ini
-# Your chat model's OpenAI-compatible endpoint, AS SEEN FROM INSIDE A CONTAINER.
-#   LiteLLM, another box:  http://<its-ip>:4000/v1
-#   Ollama,  another box:  http://<its-ip>:11434/v1
-#   Same host:             http://host.docker.internal:<port>/v1   ← see note below
-LLM_URL=http://host.docker.internal:4000/v1
+**Firewall.** Allow inbound SSH only. Docker-published ports bypass `ufw`
+(Docker writes its own iptables rules), which is why every port in this stack,
+and the model server below, is bound to a loopback or bridge address rather
+than relying on the host firewall.
 
-# API key. Blank for Ollama, or a LiteLLM proxy with no auth.
-LLM_KEY=
+---
 
-# The model name the endpoint exposes for chat.
-#   LiteLLM: the model_list name.   Ollama: the pulled tag (`ollama list`).
-CHAT_MODEL=qwen3-27b
+## 4. Chat model
+
+One instruction model does both classification and drafting. Hard
+requirements:
+
+| Requirement | Why | Failure mode if missing |
+|---|---|---|
+| Token **logprobs** on `/v1/chat/completions` | Confidence = P(`true`) of each classifier flag | Every email routes to a human, silently |
+| **JSON-schema** `response_format` | Classifier output is grammar-constrained | Classification errors → human |
+| **No reasoning/thinking output** | Output must be the JSON/body only | Empty classification → human |
+| Context ≥ 8192 tokens | Drafting prompt carries doc extracts + thread | Truncated extracts, refusals |
+
+Reference: **Qwen2.5-32B-Instruct Q4_K_M** on llama.cpp (non-reasoning, so
+nothing to disable). Qwen2.5-14B on a 16 GB GPU works with more borderline mail
+sent to people.
+
+### 4a. llama.cpp on this host
+
+```sh
+sudo mkdir -p /opt/models && sudo chown "$USER" /opt/models
+curl -L -o /opt/models/qwen2.5-32b-instruct-q4_k_m.gguf \
+  "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q4_K_M.gguf?download=true"
+
+docker run -d --name llama --restart unless-stopped --gpus all \
+  -p 172.17.0.1:8080:8080 \
+  -v /opt/models:/models:ro \
+  ghcr.io/ggml-org/llama.cpp:server-cuda \
+  -m /models/qwen2.5-32b-instruct-q4_k_m.gguf --alias qwen2.5-32b \
+  --host 0.0.0.0 --port 8080 -c 16384 -ngl 999 --jinja
+
+docker logs -f llama     # until "server is listening"
 ```
 
-> **Reaching a model server on the same host.** `host.docker.internal` resolves
-> to the host's docker-bridge gateway, **not** `127.0.0.1`. A model server bound
-> to `127.0.0.1` only (many LiteLLM/Ollama setups are) is **unreachable** from a
-> container and every email silently routes to a human. Fix one of:
-> - bind the model server to `0.0.0.0` (Ollama: `OLLAMA_HOST=0.0.0.0`; LiteLLM:
->   publish `0.0.0.0:<port>` or a `172.17.0.1:<port>` mapping), **or**
-> - put it on a docker network this stack also joins — copy
->   `docker-compose.override.yml.example` to `docker-compose.override.yml`, set
->   the network name, and use `LLM_URL=http://<service-name>:<container-port>/v1`.
+- `-p 172.17.0.1:8080:8080` publishes on the Docker bridge only: reachable
+  from the stack's containers as `http://host.docker.internal:8080/v1`, not
+  from the network. Check the bridge IP with
+  `docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'`.
+- `--alias` is the value for `CHAT_MODEL`.
+- Out of VRAM: lower `-ngl` (e.g. `40`) to offload layers to CPU.
+- Qwen3 or another reasoning model: add `--reasoning-budget 0`.
 
-> **If your model is served by Ollama, read §5 now** — you very likely need
-> `EC_ALLOW_UNCALIBRATED=1`, without which the assistant drafts nothing.
+### 4b. Other backends
 
-Then:
+- **LiteLLM** over llama.cpp/vLLM: returns logprobs. For reasoning models set
+  `chat_template_kwargs: {"enable_thinking": false}` in the `model_list` entry.
+- **Ollama**: ≥ 0.12 for logprobs; `OLLAMA_HOST=0.0.0.0`,
+  `OLLAMA_CONTEXT_LENGTH=8192`, `OLLAMA_KEEP_ALIVE=-1`, a non-thinking tag.
+  Without logprobs set `EC_ALLOW_UNCALIBRATED=1` (routing then uses the bare
+  flags; still fails safe, but the confidence threshold no longer applies and
+  responses carry `"calibrated": false`). If the context can't be raised
+  server-side, `EC_NUM_CTX=8192`.
+- **Model in another compose stack on this host, reachable only on that
+  stack's network:** `cp docker-compose.override.yml.example
+  docker-compose.override.yml`, set the network name, and use
+  `LLM_URL=http://<service>:<port>/v1`. Not needed otherwise.
+
+### 4c. Acceptance check
+
+```sh
+EP=http://172.17.0.1:8080/v1; M=qwen2.5-32b
+curl -s $EP/chat/completions -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the word ok\"}],\"logprobs\":true,\"top_logprobs\":3,\"max_tokens\":10}" \
+  | jq '{content: .choices[0].message.content, logprobs: (.choices[0].logprobs.content | length)}'
+# {"content": "ok", "logprobs": >0}
+
+curl -s $EP/chat/completions -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"JSON object with key ok set to true\"}],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"t\",\"schema\":{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"]}}},\"max_tokens\":50}" \
+  | jq -r '.choices[0].message.content'
+# {"ok": true}
+```
+
+Both must pass before continuing.
+
+---
+
+## 5. Install and configure
+
+Clone into a directory named `email-classifier`: Compose derives volume names
+from it (`email-classifier_n8n_data`, …), and §9's backup commands assume it.
+
+```sh
+sudo mkdir -p /opt/email-classifier && sudo chown "$USER" /opt/email-classifier
+git clone https://github.com/breachlabz/RAG-Academy_Auto-Reply_n8n_Workflow.git /opt/email-classifier
+cd /opt/email-classifier
+git checkout <release tag or commit>        # deploy a pinned revision, not a moving branch
+
+cp .env.example .env && chmod 600 .env
+```
+
+### 5a. Configuration (`.env`)
+
+Required:
+
+| Variable | Value |
+|---|---|
+| `LLM_URL` | Model endpoint **as seen from a container**, e.g. `http://host.docker.internal:8080/v1` (§4a) |
+| `LLM_KEY` | API key, blank for llama.cpp/Ollama |
+| `CHAT_MODEL` | Model name the endpoint exposes (llama.cpp `--alias`) |
+
+Set after §6 (sending):
+
+| Variable | Value |
+|---|---|
+| `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` | App-only send registration (§6b) |
+| `GRAPH_MAILBOX` | UPN of the mailbox replies are sent from |
+
+Optional:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `EC_THRESHOLD` | `0.9` | Minimum P(academic) to draft; higher → more mail to people |
+| `EC_NON_ACADEMIC_THRESHOLD` | `EC_THRESHOLD` | P(non_academic) at which an email goes to a person even if academic |
+| `EC_ALLOW_UNCALIBRATED` | unset | Flag-only routing for backends without logprobs (§4b) |
+| `EC_NUM_CTX` | unset | Ollama `num_ctx` per request |
+| `RAG_EMAIL_GREETING` / `RAG_EMAIL_SIGNOFF` | `Hello,` / `Best regards,\nThe Training Team` | Reply shell; `\n` = line break |
+| `CHAT_MODEL_LARGE` | `CHAT_MODEL` | Larger model for evaluation runs only |
+| `REVIEW_DRY_RUN` | unset | **Testing only.** Send marks rows sent without calling Graph. Must be unset in production. |
+
+`EC_NON_ACADEMIC_THRESHOLD` is read by the classifier; to change it, also add
+it to the `classifier` service `environment` in an override file.
+
+### 5b. Start and load documents
 
 ```sh
 docker compose up -d --build
+docker compose logs -f embedder          # first boot pulls bge-m3 (~2 GB); wait for "Ready"
+docker compose ps                        # 4 containers Up, API (healthy)
+curl -fsS http://127.0.0.1:8100/health   # {"ok":true}
+
+docker compose exec classifier python -m rag check            # extraction stats per document
+docker compose exec classifier python -m rag ingest --reset   # "NN chunks -> collection 'docs'"
+docker compose exec classifier python -m rag ask "what are the training levels?"
 ```
 
-First boot downloads the embedding model (~2 GB) into a docker volume:
+`ingest` also populates the `knowledge_chunks` table (§9c).
+
+Classifier smoke test:
 
 ```sh
-docker compose logs -f embedder      # wait for "Ready" / "Starting HTTP server", then Ctrl-C
+c() { curl -s -X POST http://127.0.0.1:8100/classify -H 'Content-Type: application/json' -d "{\"text\":\"$1\"}" | jq -c '{type,route,probs}'; }
+c "What does EVH Level 3 module 2.4 cover?"                 # academic / rag
+c "I was charged twice for my course, please refund me."    # non_academic / human
 ```
-
-Check the stack:
-
-```sh
-docker compose ps
-curl -s http://127.0.0.1:8100/health ; echo      # {"ok":true}
-```
-
-If `/health` is not `ok`, see §9.
 
 ---
 
-## 4. Load the training documents
+## 6. Microsoft 365 app registrations
 
-The Word documents live in `data/docs/`. Load them into the vector store:
+Two separate registrations, least privilege each. Record client IDs, secret
+values and **secret expiry dates**.
+
+### 6a. Inbox read (delegated, used by n8n)
+
+Entra ID → App registrations → New registration:
+
+- Name `academy-email-read`, single tenant.
+- Redirect URI (Web): `http://localhost:5678/rest/oauth2-credential/callback`
+  — Entra accepts plain HTTP only for `localhost`, which is why n8n is reached
+  through an SSH tunnel at exactly `http://localhost:5678`.
+- Certificates & secrets → new client secret.
+- API permissions → Microsoft Graph → **Delegated**: `Mail.Read`,
+  `offline_access` → Grant admin consent.
+
+### 6b. Send (application, used by `/review` Send)
+
+- New registration `academy-email-send`, single tenant, no redirect URI.
+- API permissions → Microsoft Graph → **Application**: `Mail.Send` → Grant
+  admin consent.
+- Certificates & secrets → new client secret.
+- Put tenant ID, client ID, secret value and mailbox UPN in `.env` (§5a),
+  then `docker compose up -d`.
+
+**Scope it to the one mailbox.** An application `Mail.Send` grant can send as
+any mailbox in the tenant until restricted. Restrict it in Exchange Online
+(application access policy, or RBAC for Applications where your tenant uses
+it), e.g.:
+
+```powershell
+Connect-ExchangeOnline
+New-ApplicationAccessPolicy -AppId <send-app-client-id> `
+  -PolicyScopeGroupId <mail-enabled-security-group-containing-the-mailbox> `
+  -AccessRight RestrictAccess -Description "Academy auto-reply send scope"
+Test-ApplicationAccessPolicy -Identity <mailbox-upn> -AppId <send-app-client-id>   # Granted
+Test-ApplicationAccessPolicy -Identity <any-other-upn> -AppId <send-app-client-id> # Denied
+```
+
+---
+
+## 7. n8n workflow
+
+### 7a. Access
+
+n8n and the review UI are loopback-only. From an admin workstation:
 
 ```sh
+ssh -N -L 5678:127.0.0.1:5678 -L 8100:127.0.0.1:8100 <user>@<host>
+```
+
+n8n: `http://localhost:5678` (create the owner account on first load; store
+it). Review UI: `http://localhost:8100/review`.
+
+### 7b. Credentials
+
+| Name | Type | Settings |
+|---|---|---|
+| Outlook (read) | Microsoft Outlook OAuth2 API | §6a client ID/secret → **Connect my account** as the mailbox → *Account connected* |
+| Chat model | OpenAI API | Base URL = `LLM_URL`, API key = `LLM_KEY` or any non-empty string |
+| Embedder | OpenAI API | Base URL `http://embedder:80/v1`, API key any non-empty string |
+| Chroma | Chroma API (self-hosted) | Base URL `http://email-classifier-chroma:8000`, no auth |
+
+The Chroma credential must point at the same store the API writes to
+(`local_chromadb`), otherwise knowledge edits and ingests don't reach the
+agent.
+
+### 7c. Import
+
+1. Workflows → Import from File → `n8n/academy-agent-workflow.json`.
+2. Bind credentials: **New Outlook email** → Outlook; **Local Model** → Chat
+   model; **Embeddings bge-m3** → Embedder; **academy_docs** → Chroma.
+3. **Local Model**: model = `CHAT_MODEL`. **academy_docs**: collection `docs`.
+   **New Outlook email**: folder and poll interval (default Inbox, 1 min).
+4. Save. Leave inactive until §8.
+
+Re-importing a workflow drops credential bindings and deactivates it; redo
+steps 2–4 after any import. `n8n/email-classifier-form-workflow.json` is an
+optional manual test form (no credentials).
+
+---
+
+## 8. Go-live verification
+
+1. n8n → run the workflow from **Test: run manually**. Expect `Finalize`
+   `grounded: true` and a new row at `/review`.
+2. Activate the workflow.
+3. From an external account, email the mailbox: *"What are the training
+   levels and who is Level 2 aimed at?"* → row at `/review` within ~2 min →
+   **Send** → reply arrives with the original quoted.
+4. Email *"My invoice still shows unpaid, can you check?"* → no row; execution
+   ends at *Do nothing*, `reason: not routed to rag`.
+5. Confirm `REVIEW_DRY_RUN` is unset:
+   `docker exec email-classifier-api printenv REVIEW_DRY_RUN` prints nothing
+   (the review page also shows a *Dry run* badge when it's set).
+6. Take the first backup (§9e) and record secret expiry dates.
+
+---
+
+## 9. Operations
+
+All commands from `/opt/email-classifier`.
+
+### 9a. Daily use
+
+- Reviewers open `/review` through the SSH tunnel (§7a), approve or edit
+  drafts, click **Send**. A failed Send leaves the row queued with the Graph
+  error shown; nothing is recorded as sent unless Graph accepted it.
+- Only non-reviewable mail (non-academic, low confidence, undocumented) stays
+  in the Outlook inbox for manual handling.
+
+### 9b. Training documents
+
+```sh
+# replace/add files in data/docs/ (.docx .pdf .md .txt .html), then:
+docker compose exec classifier python -m rag check
 docker compose exec classifier python -m rag ingest --reset
-#   "NNN chunks -> collection 'docs'"
 ```
 
-Verify retrieval end to end (this calls your chat model):
+`check` flags documents that extract little text (scanned PDFs, text in
+images/shapes are invisible to retrieval).
 
-```sh
-docker compose exec classifier python -m rag ask "what are the training levels?"
-#   A real answer drawn from the documents, plus the source headings.
-#   If it prints the "we don't have relevant information" line or an error → §9.
-```
+### 9c. Knowledge base tuning (`knowledge_chunks`)
 
-To change the documents later: edit `data/docs/`, re-run `ingest --reset`.
-Supported: `.docx .pdf .md .txt .html`. Check extraction first with
-`docker compose exec classifier python -m rag check` — a multi-MB PDF reporting
-a few hundred characters is a scan with no text layer and no setting will
-rescue it.
+Every chunk in the collection has a row in `knowledge_chunks` in
+`data/threads.db`: `content` (the exact text embedded and shown to the model)
+and `metadata` (JSON: `source`, `heading`, `chunk_index`, plus any flat keys
+you add). Any write re-embeds the chunk and upserts it into Chroma before the
+row is committed, so the change applies to the next email on both reply paths.
+If the embedder or Chroma rejects the write, the row is left unchanged.
 
-### 4a. Tune the knowledge base (`knowledge_chunks`)
-
-Every chunk in the collection also has a row in the `knowledge_chunks` table
-in `data/threads.db`: the exact text that is embedded and shown to the model
-(`content`), and its metadata as a JSON object (`source`, `heading`,
-`chunk_index`, plus any keys you add). Editing a row re-embeds it and updates
-Chroma straight away, so the change reaches both reply paths (`/answer` /
-`/generate-reply` and the n8n agent's `academy_docs` tool) on the next email.
-
-- **In the browser:** the **Knowledge** tab on `/review` lets you search,
-  edit, add and delete chunks, and export them all as JSON.
-- **Over HTTP:** `GET/POST /knowledge`, `GET/PUT/DELETE /knowledge/{id}` (§10).
-- **As a file:**
+- **UI:** `/review` → **Knowledge** tab: search, edit, add, delete, export JSON.
+- **API:** `GET/POST /knowledge`, `GET/PUT/DELETE /knowledge/{id}` (§11).
+- **Bulk:**
   ```sh
   docker compose exec -T classifier python -m rag knowledge export > chunks.json
-  # edit chunks.json -- change content/metadata, or add {"content", "metadata"} entries
   docker compose exec -T classifier python -m rag knowledge import - < chunks.json
   ```
-  Import updates changed chunks, creates entries with no/unknown id as manual
-  chunks, and never deletes anything missing from the file. The whole file is
-  validated before anything is written.
+  Import validates the whole file first, updates changed chunks, creates
+  entries with no/unknown id as manual chunks, never deletes.
 
-**The documents win.** `ingest` overwrites the rows of every file it loads —
-your edits to those chunks included — and removes rows for sections the file
-no longer has. Chunks added by hand (`origin: manual`) are never touched by
-ingest, and survive `--reset`. A change that must outlive the next re-ingest
-belongs in the `.docx`, or in a manual chunk.
+Rules:
 
-Metadata values must be flat (string, number or boolean) — that is all
-Chroma stores. `source` and `heading` are required; `heading` is what the
-review page shows as a reply's source.
+- **Documents win.** `ingest` overwrites the rows of every file it loads
+  (edits included) and removes rows for sections no longer present. Durable
+  changes belong in the source document.
+- Manual chunks (`origin: manual`, id `manual:<hex>`) are never touched by
+  ingest and are re-embedded after `--reset`. Put the subject in `content`;
+  metadata is not embedded.
+- A manual chunk that contradicts a document chunk is not resolved for you —
+  both can be retrieved. Fix or delete the stale one.
+- Metadata values must be flat (string, number, boolean); `source` and
+  `heading` are required.
+- Table empty on an existing deployment (collection ingested before the table
+  existed): `docker compose exec classifier python -m rag knowledge pull`.
 
-For a collection ingested before this table existed, fill the table once from
-what is live (no re-embedding): `docker compose exec classifier python -m rag knowledge pull`.
+### 9d. Configuration changes
 
----
+Edit `.env`, then `docker compose up -d` (recreates only changed services).
+Reply wording, thresholds and Graph credentials are all `.env`.
 
-## 5. Chat model requirements
+### 9e. Backups
 
-`CHAT_MODEL` runs both classification and drafting.
-
-### 5a. The hard dependency — token logprobs
-
-The classifier reads the probability of the `true`/`false` token in the model's
-JSON to decide confidence. **No logprobs → classification fails for every email
-→ the whole mailbox goes to the human queue**, silently.
-
-- **LiteLLM** over llama.cpp or vLLM: returns logprobs. Nothing to do.
-- **Ollama**: its OpenAI endpoint did not return logprobs until ~**v0.12**.
-  Check (§5c). If empty and you cannot upgrade, set in `.env`:
-  ```ini
-  EC_ALLOW_UNCALIBRATED=1
-  ```
-  Routing then uses the model's plain yes/no. Still fails safe — any
-  non-academic flag still goes to a human — but the confidence
-  threshold no longer applies. Responses carry `"calibrated": false`.
-
-### 5b. Other requirements
-
-- **Strict JSON-schema decoding** (`response_format: {type: json_schema}`).
-  Any current LiteLLM/llama.cpp/vLLM, and Ollama ≥ 0.5.
-- **No hidden "thinking".** For a reasoning model (e.g. Qwen3):
-  - **LiteLLM**: add `chat_template_kwargs: {"enable_thinking": false}` to its
-    `model_list` entry.
-  - **Ollama**: pull a non-thinking tag, or `PARAMETER think false` in the
-    Modelfile.
-  If wrong, classification comes back empty → everything routes to a human.
-- **Context window ≥ 8192 tokens.** The drafting prompt (doc extracts + thread
-  history) is long. **Ollama defaults to 4096 and silently truncates.** Set
-  `OLLAMA_CONTEXT_LENGTH=8192` (or `PARAMETER num_ctx 8192`); fallback
-  `EC_NUM_CTX=8192` in `.env`.
-- **Ollama — keep the model resident.** `OLLAMA_KEEP_ALIVE=-1`, or the model
-  unloads after 5 min idle and the next email stalls ~30 s on reload.
-
-### 5c. One-shot check
-
-```sh
-curl -s http://<endpoint>/v1/chat/completions \
-  -H "Authorization: Bearer <key-or-anything>" -H "Content-Type: application/json" \
-  -d '{"model":"<model>","messages":[{"role":"user","content":"Reply with the word ok"}],
-       "logprobs":true,"top_logprobs":3,"max_tokens":10}' | jq '.choices[0]'
-```
-
-- `message.content` should be `"ok"` (non-empty → thinking is not eating output).
-- `logprobs.content` should be a populated array. `null` → you need
-  `EC_ALLOW_UNCALIBRATED=1`.
-
----
-
-## 6. Connect the Outlook mailbox
-
-### 6a. Register an app in Microsoft Entra
-
-1. [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** → **App
-   registrations** → **New registration**.
-2. Name e.g. `academy-email-autoreply`. **Single tenant** is fine.
-3. **Redirect URI**: platform **Web**, value exactly:
-   ```
-   http://localhost:5678/rest/oauth2-credential/callback
-   ```
-   (Microsoft rejects plain-http redirects *except* `localhost` — which is why
-   this stack keeps n8n on localhost.)
-4. **Register**. Copy the **Application (client) ID** from **Overview**.
-5. **Certificates & secrets** → **New client secret** → copy the **Value** now
-   (hidden after you leave the page).
-6. **API permissions** → **Add a permission** → **Microsoft Graph** →
-   **Delegated** → add **`Mail.Read`** and **`offline_access`**. Click
-   **Grant admin consent** if your tenant shows it.
-   (Only *read* — this app registration polls the inbox. It no longer needs
-   write access: nothing in n8n creates a draft or sends any more. Sending is
-   a separate, app-only registration — §6e.)
-
-### 6b. Open the n8n UI
-
-n8n is pinned to `127.0.0.1:5678` and never exposed on the network (it runs
-arbitrary code). How you reach the UI depends on where you are:
-
-- **At the machine itself** (it has a desktop): just open
-  <http://localhost:5678> in a local browser.
-- **Headless box, administering from your laptop**: forward the port, then use
-  your laptop browser:
-  ```sh
-  ssh -L 5678:127.0.0.1:5678 <user>@<this-host>
-  # then open http://localhost:5678 on your laptop
-  ```
-
-Either way the address must be exactly `http://localhost:5678` — Microsoft Entra
-only accepts `http://localhost` as a plain-HTTP OAuth redirect (§6c), not an IP
-or hostname. Create the owner account when prompted (local, stays on the box).
-
-This is only for setup and later maintenance. Once the workflow is Active the
-pipeline runs headless — no tunnel, no browser.
-
-### 6c. Add credentials
-
-1. **Microsoft Outlook OAuth2 API** — paste the Client ID and Secret from 6a,
-   confirm the redirect URL matches, **Connect my account** → sign in as the
-   mailbox account. Should show **Connected**.
-2. **LiteLLM / chat model** — a credential of type **OpenAI API** with
-   **Base URL** = your `LLM_URL` (reachable *from the n8n container* — same
-   rules as §3) and the API key. Used by the AI Agent's *Local Model* and
-   *Embeddings bge-m3* nodes.
-3. **Chroma** — type **Chroma API** (self-hosted), **Base URL**
-   `http://email-classifier-chroma:8000`, no auth. Used by the `academy_docs`
-   node. This is the same store `python -m rag ingest` writes to.
-
-### 6d. Import and wire the workflows
-
-1. **Workflows → ⋯ → Import from File** → `n8n/academy-agent-workflow.json`.
-2. Attach credentials where nodes show a warning:
-   - **New Outlook email** → the Outlook credential.
-   - **Local Model** and **Embeddings bge-m3** → the chat-model credential.
-   - **academy_docs** → the Chroma credential.
-3. Optionally open **New Outlook email** to set folder / poll interval
-   (default: Inbox, every minute).
-4. Toggle **Active**.
-
-`n8n/email-classifier-form-workflow.json` is an optional browser form for
-trying classification + retrieval by hand (`POST /answer`), no mailbox. Import
-it the same way; it needs no credentials.
-
-> **Re-importing overwrites credential bindings and the active flag.** Re-attach
-> and re-activate after any import.
-
-### 6e. Set up sending (the review queue)
-
-The workflow above only gets a reply as far as the **review queue**
-(`http://127.0.0.1:8100/review`) — nothing sends on its own. Opening that page
-without going further is fine: you can read and edit drafts, the **Send**
-button will just fail clearly ("not configured") until this step is done.
-
-Sending needs its own Microsoft Graph credential — deliberately **not** the
-Outlook OAuth2 credential from §6a. That one is *delegated*: it only works
-because a person signed in interactively, which is exactly what a background
-Send button cannot wait on. This is an **app-only** registration instead — it
-authenticates as itself, with a client id/secret, no sign-in ever:
-
-1. [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** → **App
-   registrations** → **New registration**. A second, separate app from §6a
-   (e.g. `academy-email-send`) — do not reuse that one or add these
-   permissions to it.
-2. **API permissions** → **Add a permission** → **Microsoft Graph** →
-   **Application permissions** → add **`Mail.Send`** → **Grant admin
-   consent** (a tenant admin must click this; application permissions have no
-   per-user consent).
-3. **Certificates & secrets** → **New client secret** → copy the **Value**
-   now.
-4. Copy the **Application (client) ID** and **Directory (tenant) ID** from
-   **Overview**.
-5. In `.env`:
-   ```ini
-   GRAPH_TENANT_ID=<Directory (tenant) ID>
-   GRAPH_CLIENT_ID=<Application (client) ID>
-   GRAPH_CLIENT_SECRET=<the secret VALUE>
-   GRAPH_MAILBOX=<the mailbox's sign-in email, e.g. training@yourorg.com>
-   ```
-6. `docker compose up -d` to pick up the new values.
-
-Reopen `/review` and Send should work. `mail/graph.py` is the whole
-implementation — about eighty lines, nothing more happens on the way to
-Graph.
-
----
-
-## 7. Verify end to end
-
-Send a test email to the mailbox:
-
-> Subject: *Course question* — Body: *What are the training levels and who is
-> Level 2 aimed at?*
-
-Within ~1–2 minutes a **row appears at `/review`** listing the levels, drawn
-from the documents, with your edit box pre-filled; the n8n execution ends at
-**Record reply**. Edit it or not, then click **Send** (§6e must be done first)
-— the reply goes out via Graph and the row leaves the queue.
-
-Then send: *My invoice still shows unpaid, can you check?* → **nothing in the
-queue**, the execution ends at **Do nothing** (`reason: not routed to rag`).
-Correct — billing is never auto-answered.
-
-If the first test produced no queue row, open the failing execution and read
-the node output:
-
-| Where it stops / `reason` | Meaning | Fix |
+| Asset | Location | Method |
 |---|---|---|
-| **Prepare**, `error: expected 3 bools, got 0` | endpoint returned no logprobs | §5a — `EC_ALLOW_UNCALIBRATED=1` (Ollama) |
-| **Prepare**, empty/garbled `flags` | model returned no usable classification | §5b — thinking not disabled |
-| **Prepare**, `error: request failed …` | classifier can't reach your model | §3 note + §9 |
-| **Do nothing**, `reason: not routed to rag` on an academic email | gate said human | check `flags`/`probs` in the Prepare output; raise nothing, the gate is conservative by design |
-| **Do nothing**, `reason: already handled (duplicate message_id)` | same email seen before | expected on a re-poll; send a fresh email |
-| **Human queue** | classified academic, but the agent found no grounded answer | re-run `ingest --reset` (§4); confirm the topic is in `data/docs/`; on Ollama check context length (§5b) |
-| row appears in `/review`, `"calibrated": false` | flag-only mode (§5a) | expected on Ollama without logprobs |
+| Conversations, review queue, knowledge edits, manual chunks | `data/threads.db` (+ `-wal`) | SQLite online backup (below) — don't `cp` a live WAL database |
+| n8n workflows, credentials, execution history | volume `email-classifier_n8n_data` | tar of the volume |
+| Configuration and secrets | `.env`, `docker-compose.override.yml` if used | copy, encrypted at rest |
+| Vector store | volume `email-classifier_chroma-data` | not required: rebuilt by `ingest --reset` (manual chunks restored from `threads.db`) |
 
----
-
-## 8. Day-2 operations
-
-**Change the training documents** — edit `data/docs/`, then
-`docker compose exec classifier python -m rag ingest --reset`. The n8n
-`academy_docs` node reads the same store, so nothing else to do.
-
-**Update the code** — `docker compose up -d --build classifier`.
-
-**Reply wording** (greeting, sign-off) — in `.env`:
-```ini
-RAG_EMAIL_GREETING=Hello,
-RAG_EMAIL_SIGNOFF=Best regards,\nThe Academy Team
-```
-then `docker compose up -d`. A literal `\n` becomes a line break.
-
-**Gate strictness** — `EC_THRESHOLD` in `.env` (default `0.9`; higher → more
-email to a human).
-
-**Review and send replies** — `http://127.0.0.1:8100/review`. Every grounded
-reply waits there until a human sends it (§6e); nothing sends on its own.
-
-**Reply format** — automatic: a numbered/bulleted enquiry, an "in points" ask,
-or several questions produces a `- ` list; otherwise prose. `Prepare` decides
-it (`format` field) and `Finalize` enforces it. Test with
-`python -m rag ask --list "…"` / `--prose`.
-
-**Back up** — the stateful things are docker volumes plus one file:
-- `email-classifier_chroma-data` — ingested vectors (rebuildable from
-  `data/docs/`).
-- `email-classifier_n8n_data` — workflows, credentials, execution history.
-- `./data/threads.db` — conversation memory (a bind mount).
 ```sh
-docker run --rm -v email-classifier_n8n_data:/v -v "$PWD":/out alpine \
-  tar czf /out/n8n-backup.tgz -C /v .
+B=/var/backups/email-classifier/$(date +%F); sudo mkdir -p "$B" && sudo chown "$USER" "$B"
+docker compose exec -T classifier python -c \
+  "import sqlite3; sqlite3.connect('/app/data/threads.db').backup(sqlite3.connect('/app/data/threads.backup.db'))" \
+  && mv data/threads.backup.db "$B/threads.db"
+docker run --rm -v email-classifier_n8n_data:/v:ro -v "$B":/out alpine tar czf /out/n8n_data.tgz -C /v .
+install -m 600 .env "$B/env"
 ```
 
-**Stop / start**
+Schedule it (e.g. `/etc/cron.d/email-classifier`, daily) and ship `$B` off
+host. Retention per your policy.
+
+Restore:
+
 ```sh
-docker compose stop        # keeps everything
-docker compose down        # removes containers, keeps volumes
-docker compose down -v     # ALSO deletes volumes — loses n8n creds + vectors
+docker compose stop classifier n8n
+cp <backup>/threads.db data/threads.db && rm -f data/threads.db-wal data/threads.db-shm
+docker run --rm -v email-classifier_n8n_data:/v -v <backup>:/in alpine sh -c "find /v -mindepth 1 -delete && tar xzf /in/n8n_data.tgz -C /v"
+docker compose up -d
+docker compose exec classifier python -m rag ingest --reset   # if chroma-data was lost
 ```
 
----
+### 9f. Upgrades and rollback
 
-## 9. Troubleshooting
+```sh
+# 1. back up (9e)
+git fetch --tags && git checkout <new tag or commit>
+docker compose up -d --build            # rebuilds the API image; recreates changed services
+docker compose ps && curl -fsS http://127.0.0.1:8100/health
+# 2. run the classifier smoke test (5b) and apply any release-specific steps
+```
 
-Run everything from `email-classifier/`.
+Rollback: `git checkout <previous tag>` and `docker compose up -d --build`.
+Schema changes are additive (new tables/columns only), so older code runs
+against a newer `threads.db`. If a release re-ingested the collection, re-run
+`ingest --reset` after rolling back.
 
-**`docker compose up` fails** — check Compose is v2 (`docker compose version`).
+Release-specific steps for the version introducing `academic`/`non_academic`
+classification and the Knowledge tab, when upgrading an existing deployment:
 
-**`embedder` keeps restarting** — still downloading, or out of disk
-(`docker compose logs embedder`, needs ~3 GB).
+- `docker compose exec classifier python -m rag knowledge pull`
+- `docker compose up -d` also recreates `n8n` (new `host.docker.internal`
+  mapping); state is in its volume.
+- Re-import the optional form workflow if used (score fields renamed).
+- `EC_ADMIN_THRESHOLD` was renamed `EC_NON_ACADEMIC_THRESHOLD`.
 
-**`/health` not ok / API logs show `chromadb` connection errors** —
-`docker compose restart classifier`; if it persists,
-`docker compose down && docker compose up -d`.
+### 9g. Monitoring
 
-**`rag ask` error mentions the embeddings endpoint** — `embedder` not ready
-yet (`docker compose logs embedder`, wait for `Ready`).
+| Signal | Check |
+|---|---|
+| API liveness | `curl -fsS http://127.0.0.1:8100/health`; container health `docker inspect -f '{{.State.Health.Status}}' email-classifier-api` |
+| All services up | `docker compose ps` (+ `docker ps -f name=llama` for the model) |
+| Model reachable from the stack | `docker exec email-classifier-api python -c "from classifier.core import BASE_URL,auth_headers;import urllib.request as u;print(u.urlopen(u.Request(BASE_URL+'/models',headers=auth_headers()),timeout=5).status)"` → `200` |
+| Mail flowing | n8n → Executions: successful runs every poll; failures on *Prepare* indicate model/API problems |
+| Review backlog | `curl -s http://127.0.0.1:8100/review/queue \| jq '[.pending[].exchanges[]] \| length'` |
+| Logs | `docker compose logs --since 1h classifier` (also `n8n`, `embedder`, `local_chromadb`) |
+| Secret expiry | both Entra client secrets (§6) — rotate before expiry: update the n8n Outlook credential and `GRAPH_CLIENT_SECRET` + `docker compose up -d` |
 
-**`rag ask` error mentions chat/completions, or connection refused/timeout** —
-`classifier` cannot reach your model at `LLM_URL`:
-- from the host: `curl $LLM_URL/models` — does it answer?
-- same-host model server: see the §3 note (must not be `127.0.0.1`-only).
-- another machine: firewall open to this host, Ollama bound to `0.0.0.0`.
-- after editing `.env`: `docker compose up -d` to recreate.
+### 9h. Lifecycle
 
-**Everything routes to the human queue** — the **Prepare** node output:
-- `error: expected 3 bools, got 0` → no logprobs → §5a.
-- empty/malformed `flags` → model is "thinking" → §5b, restart the model server.
+```sh
+docker compose stop | start | restart classifier
+docker compose down          # removes containers, keeps volumes and data/
+docker compose down -v       # DESTROYS n8n credentials/workflows and vectors — never in production
+```
 
-**Outlook "Connect my account" fails / redirect error** — the browser must
-reach n8n as exactly `http://localhost:5678` (via the SSH tunnel), and the
-Entra redirect URI must match `http://localhost:5678/rest/oauth2-credential/callback`
-character for character.
-
-**Workflow runs, `grounded: true`, but nothing shows at `/review`** — check
-`docker compose logs classifier` around the `Record reply` call; a reply is
-only queued once `/threads/reply` has actually recorded it. If it's there but
-**Send** fails with *"not configured"*, §6e hasn't been done yet — that's
-expected, not a bug, until `GRAPH_*` is set in `.env`.
-
-**Send fails with a 502 from Graph** — the row stays in the queue (nothing is
-lost) and the error in the page names what Graph rejected. Common causes: the
-app registration's `Mail.Send` permission was added but admin consent was
-never granted, or `GRAPH_MAILBOX` isn't a real mailbox in the tenant.
-
-**Container logs** — `docker compose logs -f classifier` (or `n8n`, `embedder`,
-`chromadb`).
+All services use `restart: unless-stopped` and come back after a host reboot.
 
 ---
 
-## 10. HTTP API
+## 10. Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| *Prepare*: `error: expected 2 bools, got 0` | Backend returns no logprobs | §4c; Ollama → `EC_ALLOW_UNCALIBRATED=1` |
+| *Prepare*: `error: request failed …` / `rag ask` connection refused | API can't reach `LLM_URL` | Test from the container (§9g); same-host server must be bound to the bridge/0.0.0.0, not 127.0.0.1 |
+| Empty or malformed `flags` | Model emits reasoning | §4a `--reasoning-budget 0` / §4b `enable_thinking: false` |
+| Everything goes to *Human queue* on academic mail | Documents don't answer it, or truncated context | `ingest --reset`; confirm topic in `data/docs/`; context ≥ 8192 |
+| *Do nothing*, `already handled (duplicate message_id)` | Same message polled again | Expected |
+| `/health` fails or Chroma errors in API logs | Chroma/embedder not ready | `docker compose logs local_chromadb embedder`; `docker compose restart classifier` |
+| `embedder` restarting | Model download in progress or disk full | `docker compose logs embedder`; ≥ 3 GB free |
+| Knowledge save returns 502 | Embedder or Chroma unreachable | Row unchanged; fix the service and retry |
+| n8n Outlook *Connect* fails | Redirect mismatch | Browser must be at exactly `http://localhost:5678`; redirect URI must match §6a |
+| n8n agent answers from stale content | n8n Chroma credential points elsewhere | Must be `http://email-classifier-chroma:8000` (§7b) |
+| Send → 503 *not configured* | `GRAPH_*` missing | §6b, then `docker compose up -d` |
+| Send → 502 | Graph rejected | Row stays queued; check admin consent, `GRAPH_MAILBOX`, access policy scope |
+| Rows marked sent but no mail delivered | `REVIEW_DRY_RUN` set | Unset it, `docker compose up -d` |
+
+---
+
+## 11. HTTP API
 
 `http://classifier:8100` inside the compose network, `http://127.0.0.1:8100`
-from the host. The safety logic lives here; the workflows are plumbing.
+on the host. No authentication — loopback/tunnel access only (§12).
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | `{"ok": true}` |
-| `POST /classify` | `{"text": "..."}` → `type`, `route`, `flags`, `probs`, `calibrated` |
-| `POST /answer` | `{"text": "..."}` → classify + retrieve + grounded reply, **stateless**. What the test form and `scripts/rag_eval.py` use. |
-| `POST /generate-reply` | `{"email_text", "conversation_id", "subject", "message_id"}` → the whole pipeline in one call, thread-aware. An alternative to the split `prepare`/`finalize` for a one-HTTP-node workflow. |
-| `POST /emails/prepare` | `{"body", "is_html", "subject", "conversation_id", "message_id", "ref"}` → `proceed`, `history`, `email_text`, `query`, `format`, `ref`, `duplicate`, `reason`. Front half of the Outlook path. |
-| `POST /emails/finalize` | `{"output", "conversation_id", "subject", "format"}` → `grounded`, `reply`, `subject`, `agent_output`, `reason`. Back half. |
-| `POST /threads/reply` | `{"conversation_id", "reply", "subject", "grounded"}` → records the drafted reply and, when grounded, queues it for review. |
-| `GET /threads` / `GET /threads/{id}` | stored conversations / one conversation's turns |
-| `GET /review` | the review queue page — open this in a browser |
-| `GET /review/queue` | `{"pending": [...]}` → grounded replies awaiting a human, with a cached one-line `query_gist` |
-| `GET /knowledge` | every chunk as `{id, content, metadata, origin, edited, created_at, updated_at}`, plus the list of `sources`. |
-| `POST /knowledge` | `{"content": "...", "metadata": {...}}` → adds a manual chunk (embedded and pushed to Chroma). |
-| `GET` / `PUT` / `DELETE /knowledge/{id}` | one chunk. `PUT {"content"?, "metadata"?}` re-embeds and updates Chroma; `metadata` replaces the whole object. URL-encode the id (`#` → `%23`). 422 invalid input, 502 embedder/Chroma failure (row left unchanged). See §4a. |
-| `POST /review/{id}/send` | `{"reply": "..."}` → sends it via Graph (§6e) and records the sent text. 503 if Graph isn't configured yet, 502 if Graph rejected it — either way the row stays queued so nothing is silently lost. |
+| `POST /classify` | `{"text"}` → `type`, `route`, `flags`, `probs`, `calibrated` |
+| `POST /answer` | `{"text"}` → classify + retrieve + grounded reply, stateless (test form, `scripts/rag_eval.py`) |
+| `POST /generate-reply` | `{"email_text", "conversation_id", "subject", "message_id"}` → full pipeline in one call, thread-aware |
+| `POST /emails/prepare` | `{"body", "is_html", "subject", "conversation_id", "message_id", "ref"}` → `proceed`, `history`, `email_text`, `query`, `format`, `ref`, `duplicate`, `reason` |
+| `POST /emails/finalize` | `{"output", "conversation_id", "subject", "format"}` → `grounded`, `reply`, `subject`, `agent_output`, `reason` |
+| `POST /threads/reply` | `{"conversation_id", "reply", "subject", "grounded"}` → records the draft; queues it when grounded |
+| `GET /threads`, `GET /threads/{id}` | conversations / one conversation's turns |
+| `GET /review` | review UI (Reply review + Knowledge tabs) |
+| `GET /review/queue`, `GET /review/history` | pending / sent replies grouped by conversation |
+| `POST /review/{id}/send` | `{"reply", "attachment_*"?}` → sends via Graph, records it. 503 not configured, 502 Graph rejected (row stays queued), 413 attachment > 3 MB |
+| `GET /knowledge` | all chunks `{id, content, metadata, origin, edited, created_at, updated_at}` + `sources` |
+| `POST /knowledge` | `{"content", "metadata"}` → manual chunk, embedded and upserted |
+| `GET`/`PUT`/`DELETE /knowledge/{id}` | one chunk; `PUT {"content"?, "metadata"?}` re-embeds (metadata replaces the whole object). URL-encode ids (`#` → `%23`). 404 / 422 invalid / 502 embedder or Chroma failure |
 
-Notes:
-- **`type`** is `academic` only when the email is academic and nothing else;
-  everything else — a mixed course-and-payment email, spam, an email the model
-  set no flag on — is `non_academic`, never auto-answered. `unknown` means the
-  classification itself failed.
-- **`reply`** is the grounded answer, or the no-information line when the
-  documents do not cover it, or empty for non-academic/error.
-- **`format`** (`/answer`, `/generate-reply`, and echoed through
-  `prepare`→`finalize`): `"auto"` (default) decides list vs prose from the
-  enquirer's wording; `"list"` / `"prose"` force it.
-- **`sources`** / **`closest`** are diagnostic only — see §11.
+- `type` is `academic` only when academic and nothing else; otherwise
+  `non_academic`. `unknown` = classification failed.
+- `route` is the field to branch on (`rag` / `human`).
+- `format`: `auto` (list vs prose from the enquirer's wording), `list`, `prose`.
+
+---
+
+## 12. Security model and guarantees
+
+- **No automatic sending.** Only `POST /review/{id}/send` reaches
+  `mail/graph.py`; nothing in the classify/retrieve/draft path has Graph
+  access. A failed Send is never recorded as sent.
+- **No network exposure.** Every service binds to `127.0.0.1` (model server to
+  the Docker bridge). The review UI, Knowledge editor and API have **no
+  authentication** — access is via SSH tunnel only. Exposing them requires an
+  authenticating reverse proxy (SSO) in front; knowledge edits change live
+  replies.
+- **n8n executes arbitrary code** — never publish port 5678.
+- **Least privilege in Graph:** read is delegated `Mail.Read`; send is
+  application `Mail.Send` scoped to one mailbox (§6b).
+- **Secrets** live in `.env` (mode 600) and the n8n volume. Neither is in git.
+  Rotate both Entra secrets before expiry.
+- **Non-academic mail never gets a draft**, and every factual sentence in a
+  draft comes from `data/docs/` or the knowledge table; unsupported questions
+  go to a person.
+- **Attachments** added at Send are passed straight to Graph (≤ 3 MB) and
+  never stored; only the file name is recorded.
+
+---
+
+## 13. Design notes
+
+**Two labels, multi-label.** `academic` and `non_academic` are independent
+booleans under a constrained grammar, so the logprob of each `true`/`false`
+token is P(label) — a real number to threshold, not a model-stated
+confidence. A course question with a payment issue sets both and goes to a
+person.
+
+**Two independent gates, both failing to `human`.** The classifier asks
+whether an email *may* be auto-answered: `route()` returns `human` for
+non-academic (≥ `EC_NON_ACADEMIC_THRESHOLD`), not academic, below
+`EC_THRESHOLD`, malformed or errored. Retrieval/drafting asks whether it *can*
+be answered from what we hold (`grounded`). Neither raises; failures arrive as
+`error`.
+
+**The distance gate cannot judge correctness.** Distances for answerable and
+unanswerable questions overlap (a price question is on-topic but may have no
+answer). `RAG_MAX_DISTANCE` is only a guard against unrelated input. The model
+declining is the real gate, backed by `rag.core.refuses_in_prose()`, which
+catches prose that reports the documents as silent (a source word **and** a
+negated reporting verb). `scripts/rag_eval.py` pins that boundary — rerun it
+whenever the prompt or model changes.
+
+**Chunk size is a retrieval parameter.** At 1200 chars a per-level section
+split and "what are the three levels?" came back with two. At 3000 sections
+survive whole.
+
+**Threading.** A follow-up ("and the second one?") carries no subject matter
+of its own. `threads/` stores conversations (SQLite, keyed by Outlook
+`conversationId`, deduplicated on `internetMessageId`); `classify()` is shown
+the thread as context but labels the latest email only, so an invoice question
+inside an academic thread still goes to a person. Follow-ups are rewritten into
+standalone questions before embedding.
+
+**Embedding.** bge-m3, 1024-dim, CPU. Vectors are always computed in
+`rag.core.embed()` and passed to Chroma (collections use
+`embedding_function=None`). Changing `RAG_EMBED_MODEL` requires
+`ingest --reset`.
+
+**.docx extraction is lossy.** `rag/docx_text.py` handles bold-only headings,
+hard-wrapped text and tables, but ignores images, shapes and text boxes. Run
+`python -m rag check` on every new document.
+
+**`SYSTEM` and `SCHEMA` in `classifier/core.py` must stay in sync** (same
+keys, same order). Otherwise constrained decoding forces tokens the model
+finds unlikely and the logprobs stop measuring the classification.
+
+---
+
+## 14. Evaluation
 
 ```sh
-curl -s -X POST http://127.0.0.1:8100/answer -H 'Content-Type: application/json' \
-  -d '{"text":"does level 2 include hands-on hardware work?"}'
+python scripts/generate.py --out data           # synthetic set on the large model, 70/30 split
+python scripts/evaluate.py data/holdout.jsonl   # classifier threshold sweep
+python scripts/rag_eval.py                       # grounding: leaks vs misses
+python scripts/thread_eval.py                    # follow-up resolution
+docker cp tests email-classifier-api:/app/ && docker compose exec classifier python -m unittest tests.test_logic   # tests are not baked into the image
 ```
+
+Generation uses a different model than classification to avoid correlated
+blind spots. `rag_eval.py` fails only on a **leak** (answered without
+support). Set the production threshold against hand-labelled real mail, not
+the synthetic set.
 
 ---
 
-## 11. Design notes
-
-**Multi-label, not single-label.** An email about the Level 2 syllabus *and* an
-unpaid invoice is genuinely both. Two independent booleans — `academic` and
-`non_academic` — set under a constrained grammar, so the logprob of
-each `true`/`false` token *is* P(label): a real number to sweep a threshold
-over, not a model role-playing "confidence: high".
-
-**Two independent gates, both failing to `human`.** Phase 1 (`classifier`) asks
-*may* this be auto-answered — `route()` returns `human` for anything
-non-academic (at or above `EC_NON_ACADEMIC_THRESHOLD`, default = `EC_THRESHOLD`),
-not academic, below threshold, malformed or errored.
-Phase 2 (`rag` / the agent) asks *can* it be, from what we actually hold — an
-email can clear the classifier and still have no answer in the documents
-(`grounded=false`). Neither step ever raises; failures arrive as an `error`
-field.
-
-**The distance gate cannot judge correctness.** Over nineteen hand-labelled
-questions the cosine distances for answerable and unanswerable ones *overlap* —
-a price question is topically about the training, it just has no answer in the
-docs. So `RAG_MAX_DISTANCE` is only a crash-guard for wholly-unrelated input.
-Everything rests on the model declining to answer, and the bare
-`NOT_IN_DOCUMENTS` token alone leaked (the 9B answered ~3/7 unanswerables in
-prose that *reports the docs as silent*). `rag.core.refuses_in_prose()` is the
-second net: a sentence must contain **both** a source word (document, text,
-provided, …) **and** a negated reporting verb (does not specify / mention /
-contain / …). `scripts/rag_eval.py` pins that boundary — run it whenever the
-prompt or model changes, it is a regex over model prose and will rot.
-
-**Chunk size is a retrieval parameter.** At 1200 chars "Who can take the EVH
-training?" split one-chunk-per-level and "what are the three levels?" returned
-two and reported the third missing. At 3000 the section survives whole. A
-question about a section wants the section.
-
-**Threading — a follow-up does not classify as an email.** *"and what does the
-second one cover?"* alone scored academic 0.22 / spam 0.78 (under the old
-three-label schema) and routed to a human — it is a bag of stopwords with no institute in sight, so every
-conversation used to die at the gate on its *second* message. `threads/` is the
-memory (SQLite, keyed by Outlook `conversationId`, deduped on
-`internetMessageId`). `classify()` takes optional `context`: it changes what
-the model is *shown*, never what it is asked — the label still describes the
-latest email alone, so an invoice question inside an academic thread still
-routes to a human. `threads/context.py` also rewrites the follow-up into a
-standalone question before it is embedded, because embeddings have no memory.
-
-**Embedding — bge-m3, 1024-dim, CPU.** Chroma is never given an embedding
-function; every vector is computed in `rag.core.embed()` and passed in, and
-collections are built with `embedding_function=None` (otherwise Chroma
-reconstructs its default MiniLM and would silently embed with the wrong model
-if anyone passed `query_texts`). Vectors from two embedders are not comparable,
-so changing `RAG_EMBED_MODEL` means `ingest --reset`. bge-m3 takes raw text on
-both sides — no `query:` / `passage:` prefix.
-
-**.docx extraction is lossy.** `rag/docx_text.py` converts Word to the markdown
-the chunker expects, handling designed documents (headings marked only by being
-*entirely* bold, hard-wrapped sentences, curriculum content in tables). It
-**ignores images entirely** — a 2.8 MB file holding 8 KB of text means whatever
-three diagrams say is invisible to retrieval. Run
-`python -m rag check` on any new document; text in shapes and text boxes is not
-picked up and the only symptom is the model refusing questions it should
-answer.
-
-**Gotcha — `SYSTEM` and `SCHEMA` in `classifier/core.py` must stay in sync**
-(same field names, same order). When the prompt does not describe the schema,
-grammar-constrained decoding forces tokens the model finds unlikely and the
-logprobs then measure the grammar overriding the model, not the
-classification — your confidence signal goes silently garbage.
-
----
-
-## 12. Evaluating
-
-```sh
-python scripts/generate.py --out data           # ~380 synthetic emails, on the large model
-python scripts/evaluate.py data/holdout.jsonl   # threshold sweep, Phase 1
-python scripts/rag_eval.py                       # refusal / leak measurement, Phase 2
-python scripts/thread_eval.py                    # follow-up resolution, Phase 3
-```
-
-Generation runs on a *different* (larger) model than classification on purpose —
-one model for both gives correlated blind spots and flatters the score.
-`rag_eval.py` fails the run only on a **leak** (answered without support); a
-**miss** costs human-queue volume and harms nobody. Before trusting any number:
-hand-label the holdout, and set the production threshold against **real** mail.
-
----
-
-## 13. Repo layout
+## 15. Repository layout
 
 ```
-api.py                    the HTTP surface (classify / answer / generate-reply /
-                          emails.prepare / emails.finalize / threads.reply / review)
-classifier/core.py        classify() + route(), prompt and JSON schema
-classifier/__main__.py    CLI:  python -m classifier "…"
-rag/core.py               ingest() + retrieve() + answer(), embed(), chunking, grounding
-rag/docx_text.py          .docx -> markdown, plus verify() for extraction loss
-rag/format_hint.py        list-vs-prose decision + as_bullets() coercion
-rag/knowledge.py          SQLite: knowledge_chunks, the editable copy of the collection
-rag/__main__.py           CLI:  python -m rag  {ingest | ask | check | manifest | knowledge}
-threads/store.py          SQLite: conversations + turns, dedupe on message id, review queue
-threads/context.py        history block + standalone-question rewrite + rolling summary
-threads/gist.py           one-line query summary for the review queue, cached per row
-mail/text.py              html -> prose, and cutting the quoted reply
-mail/graph.py             app-only Microsoft Graph client -- the review queue's Send
-frontend/                 the review queue: a Next.js app, statically exported
-                          (`npm run build` -> frontend/out/) and served by
-                          api.py at /review -- no Node process at runtime
-n8n/academy-agent-workflow.json          the mailbox pipeline
-n8n/email-classifier-form-workflow.json  the optional manual test form
-data/docs/                source documents for the vector store
-scripts/                  generate / evaluate / rag_eval / thread_eval
-docker-compose.override.yml.example      per-host model-network wiring
+api.py                      HTTP API (classify, answer, prepare/finalize, threads, review, knowledge)
+classifier/core.py          classify() + route(): prompt, JSON schema, thresholds
+rag/core.py                 ingest(), retrieve(), answer(), embed(), chunking, grounding
+rag/knowledge.py            knowledge_chunks table, synced to Chroma on every write
+rag/docx_text.py            .docx → markdown, extraction checks
+rag/format_hint.py          list-vs-prose decision
+rag/__main__.py             CLI: python -m rag {ingest|ask|check|manifest|knowledge}
+threads/store.py            conversations, turns, dedupe, review queue (SQLite)
+threads/context.py          history block, standalone-question rewrite, rolling summary
+threads/gist.py             one-line enquiry summary for the review UI
+mail/text.py                HTML → text, quoted-reply stripping
+mail/graph.py               app-only Graph send (reply, HTML rendering, attachment)
+frontend/                   review UI (Next.js static export → served at /review)
+n8n/academy-agent-workflow.json          mailbox pipeline
+n8n/email-classifier-form-workflow.json  optional manual test form
+data/docs/                  source documents
+tests/test_logic.py         unit and regression tests
+scripts/                    generate / evaluate / rag_eval / thread_eval
+docker-compose.yml          the stack
+docker-compose.override.yml.example      optional per-host network wiring (§4b)
 ```
-
----
-
-## 14. Guarantees
-
-- **Nothing sends automatically.** Every grounded reply stops in the review
-  queue (`/review`); the only thing that sends it is a human clicking Send
-  there, optionally after editing it. Nothing in the classify/retrieve/draft
-  path (Prepare, the AI Agent, Finalize, Record reply) has network access to
-  Graph at all — only `POST /review/{id}/send`, and only when it is called,
-  ever reaches `mail/graph.py`.
-- A failed or not-yet-configured Send never gets recorded as sent. The row
-  stays in the queue and the human sees why, instead of the system silently
-  believing something went out that didn't (§9).
-- No container is reachable off `127.0.0.1`. The review page has no login of
-  its own — it inherits that same "trusted local network" boundary. Put it
-  behind real auth before exposing it any wider.
-- Non-academic email (payments, records, spam) never receives an automated
-  reply, and never reaches the review queue at all.
-- Every factual sentence in a reply comes from `data/docs/`. If the documents
-  do not cover a question, the email goes to the human queue rather than
-  getting a guessed answer.
