@@ -15,9 +15,9 @@ n8n cannot import the Python module, so it talks to this over HTTP instead.
     GET  /review/queue    grounded replies awaiting review, as JSON
     GET  /review/history  already-sent replies, most recent first, as JSON
     POST /review/{id}/send  {"reply": "..."}  -> send it (Graph) and record it
-    GET  /knowledge       editable knowledge chunks (content + JSON metadata)
-    POST /knowledge       {"content": ..., "metadata": {...}} -> add a chunk
-    GET|PUT|DELETE /knowledge/{id}  one chunk; writes re-embed and update Chroma
+    GET  /knowledge       knowledge chunks (content + JSON metadata), read-only
+    POST /knowledge       {"content": ..., "title"?: ...} -> append to Additions_N.docx
+    GET  /knowledge/{id}  one chunk
     GET  /health
 
 /emails/prepare and /emails/finalize are /generate-reply split in two, for the
@@ -70,6 +70,7 @@ from rag import answer as rag_answer
 from rag import answer_followup
 from rag import is_near_duplicate
 from rag import resolve_format
+from rag import additions as rag_additions
 from rag import knowledge as rag_knowledge
 from rag.core import COLLECTION as RAG_COLLECTION
 from rag.core import EMAIL_SUBJECT, format_email, ground
@@ -915,28 +916,24 @@ def review_send(exchange_id: int, req: SendReplyRequest) -> dict:
 
 # --- Knowledge base -----------------------------------------------------
 #
-# The editable copy of what retrieval searches: one row per Chroma chunk in
-# `knowledge_chunks` (rag/knowledge.py), with its metadata as JSON. Every
-# write re-embeds the chunk and updates the collection before the row is
-# saved, so an edit here changes what both reply paths retrieve. Same trust
-# boundary as /review: localhost only, no login of its own.
+# A read-only view of what retrieval searches: one row per Chroma chunk in
+# `knowledge_chunks` (rag/knowledge.py), with its metadata as JSON. Existing
+# chunks cannot be edited or deleted here -- the .docx files are the source.
+# The one write is adding: POST appends an entry to data/docs/Additions_N.docx
+# (rag/additions.py, 20 entries per file) and ingests that file, so additions
+# are ordinary document chunks. Same trust boundary as /review: localhost
+# only, no login of its own.
 #
 # Chunk ids contain "#" (e.g. "EVH_Level_3_2.4.docx#3"), so callers must
 # URL-encode them (%23) -- the `:path` converter keeps any "/" intact too.
 
 
-class KnowledgeUpdateRequest(BaseModel):
-    """PUT /knowledge/{id}. Either field may be omitted; `metadata`, when
-    sent, replaces the whole object rather than patching it."""
+class KnowledgeAddRequest(BaseModel):
+    """POST /knowledge. `title` is optional; the first line of `content`
+    stands in for it."""
 
-    content: str | None = None
-    metadata: dict | None = None
-
-
-class KnowledgeCreateRequest(BaseModel):
     content: str
-    metadata: dict = {}
-    id: str | None = None
+    title: str = ""
 
 
 def _knowledge_call(fn, *args, **kwargs):
@@ -961,10 +958,9 @@ def knowledge_list(q: str = "", source: str = "") -> dict:
 
 
 @app.post("/knowledge")
-def knowledge_create(req: KnowledgeCreateRequest) -> dict:
-    return _knowledge_call(
-        rag_knowledge.create_chunk, req.content, req.metadata, chunk_id=req.id or None
-    )
+def knowledge_add(req: KnowledgeAddRequest) -> dict:
+    """Append to the current data/docs/Additions_N.docx and ingest it."""
+    return _knowledge_call(rag_additions.add, req.content, req.title)
 
 
 @app.get("/knowledge/{chunk_id:path}")
@@ -973,16 +969,3 @@ def knowledge_get(chunk_id: str) -> dict:
     if chunk is None:
         raise HTTPException(404, "no such chunk")
     return chunk
-
-
-@app.put("/knowledge/{chunk_id:path}")
-def knowledge_update(chunk_id: str, req: KnowledgeUpdateRequest) -> dict:
-    return _knowledge_call(
-        rag_knowledge.update_chunk, chunk_id, content=req.content, metadata=req.metadata
-    )
-
-
-@app.delete("/knowledge/{chunk_id:path}")
-def knowledge_delete(chunk_id: str) -> dict:
-    _knowledge_call(rag_knowledge.delete_chunk, chunk_id)
-    return {"ok": True, "id": chunk_id}

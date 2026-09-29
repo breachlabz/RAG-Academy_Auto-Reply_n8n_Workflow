@@ -1,6 +1,6 @@
-// The /knowledge endpoints in api.py -- the editable knowledge_chunks table
-// (rag/knowledge.py). Every write re-embeds the chunk and updates Chroma
-// server-side, so a save here changes what replies are drafted from.
+// The /knowledge endpoints in api.py -- a read-only view of the
+// knowledge_chunks table (rag/knowledge.py). The one write is adding new
+// content, which the server appends to an Additions document and ingests.
 //
 // Chunk ids contain "#" ("EVH_Level_3_2.4.docx#3"), which a browser would
 // otherwise treat as the start of a fragment -- always encode them.
@@ -25,14 +25,8 @@ export function fetchChunks() {
   return call(BASE);
 }
 
-export function updateChunk(id, { content, metadata }) {
-  return call(`${BASE}/${encodeURIComponent(id)}`, jsonBody("PUT", { content, metadata }));
-}
-
-export function createChunk({ content, metadata }) {
-  return call(BASE, jsonBody("POST", { content, metadata }));
-}
-
-export function deleteChunk(id) {
-  return call(`${BASE}/${encodeURIComponent(id)}`, { method: "DELETE" });
+// Appends to the current data/docs/Additions_N.docx and ingests it.
+// Returns {file, entry, max, chunks}.
+export function addContent({ title, content }) {
+  return call(BASE, jsonBody("POST", { title, content }));
 }

@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import math
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -285,6 +286,44 @@ class TestKnowledgeStore(unittest.TestCase):
         manual = self.kn.create_chunk("keep me", {"heading": "Manual"}, path=self.db)
         self.kn.record_ingest([], reset=True, path=self.db)
         self.assertEqual([r["id"] for r in self.kn.list_chunks(path=self.db)], [manual["id"]])
+
+
+class TestAdditions(unittest.TestCase):
+    """Real .docx files and the real chunker; only the embed/Chroma push is mocked."""
+
+    def setUp(self):
+        from rag import additions, knowledge
+
+        self.add = additions
+        self.docs = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.docs, ignore_errors=True)
+        db = _temp_db(self)
+        mock.patch.object(knowledge, "DB_PATH", db).start()
+        self.push = mock.patch.object(rag_core, "_collection").start()
+        mock.patch.object(rag_core, "embed", side_effect=lambda docs: [[0.0]] * len(docs)).start()
+        self.addCleanup(mock.patch.stopall)
+        self.kn = knowledge
+
+    def test_each_entry_is_its_own_chunk_with_doc_metadata(self):
+        self.add.add("Fee is 500 EUR.\nPayable in advance.", "Level 2 fee", docs_dir=self.docs)
+        out = self.add.add("Starts in March.", docs_dir=self.docs)
+        self.assertEqual((out["file"], out["entry"]), ("Additions_1.docx", 2))
+        [chunk] = out["chunks"]
+        self.assertEqual(chunk["id"], "Additions_1.docx#1")
+        self.assertEqual(
+            chunk["metadata"],
+            {"source": "Additions_1.docx", "heading": "Starts in March.", "chunk_index": 1},
+        )
+        first = self.kn.get_chunk("Additions_1.docx#0")
+        self.assertIn("Level 2 fee", first["content"])
+        self.assertIn("Payable in advance.", first["content"])
+
+    def test_rolls_over_after_max_entries(self):
+        for i in range(self.add.MAX_PER_DOC):
+            self.add.add(f"entry {i}", docs_dir=self.docs)
+        out = self.add.add("one more", docs_dir=self.docs)
+        self.assertEqual((out["file"], out["entry"]), ("Additions_2.docx", 1))
+        self.assertEqual(self.add.entry_count(self.docs / "Additions_1.docx"), self.add.MAX_PER_DOC)
 
 
 class TestNearDuplicate(unittest.TestCase):

@@ -405,18 +405,25 @@ docker compose exec classifier python -m rag ingest --reset
 `check` flags documents that extract little text (scanned PDFs, text in
 images/shapes are invisible to retrieval).
 
-### 9c. Knowledge base tuning (`knowledge_chunks`)
+### 9c. Knowledge base (`knowledge_chunks`) and Additions
 
 Every chunk in the collection has a row in `knowledge_chunks` in
 `data/threads.db`: `content` (the exact text embedded and shown to the model)
-and `metadata` (JSON: `source`, `heading`, `chunk_index`, plus any flat keys
-you add). Any write re-embeds the chunk and upserts it into Chroma before the
-row is committed, so the change applies to the next email on both reply paths.
-If the embedder or Chroma rejects the write, the row is left unchanged.
+and `metadata` (JSON: `source`, `heading`, `chunk_index`).
 
-- **UI:** `/review` → **Knowledge** tab: search, edit, add, delete, export JSON.
-- **API:** `GET/POST /knowledge`, `GET/PUT/DELETE /knowledge/{id}` (§11).
-- **Bulk:**
+- **UI:** `/review` → **Knowledge** tab: search, view, export JSON, and **Add
+  content**. Existing chunks cannot be edited or deleted from the UI or the
+  API; change them in the source document and re-ingest.
+- **Additions:** each entry added in the UI (optional title + content) is
+  appended to `data/docs/Additions_N.docx`, 20 entries per file
+  (`Additions_1.docx`, then `Additions_2.docx`, …), and that file is ingested
+  immediately. Additions are ordinary document chunks — id
+  `Additions_1.docx#<n>`, metadata `source`/`heading`/`chunk_index` — so they
+  show up in the list and survive `ingest --reset` like every other document.
+  If the embedder or Chroma rejects the write, the file is restored and
+  nothing is added (`rag/additions.py`).
+- **API:** `GET/POST /knowledge`, `GET /knowledge/{id}` (§11).
+- **Bulk (host CLI only):**
   ```sh
   docker compose exec -T classifier python -m rag knowledge export > chunks.json
   docker compose exec -T classifier python -m rag knowledge import - < chunks.json
@@ -562,8 +569,8 @@ on the host. No authentication — loopback/tunnel access only (§12).
 | `GET /review/queue`, `GET /review/history` | pending / sent replies grouped by conversation |
 | `POST /review/{id}/send` | `{"reply", "attachment_*"?}` → sends via Graph, records it. 503 not configured, 502 Graph rejected (row stays queued), 413 attachment > 3 MB |
 | `GET /knowledge` | all chunks `{id, content, metadata, origin, edited, created_at, updated_at}` + `sources` |
-| `POST /knowledge` | `{"content", "metadata"}` → manual chunk, embedded and upserted |
-| `GET`/`PUT`/`DELETE /knowledge/{id}` | one chunk; `PUT {"content"?, "metadata"?}` re-embeds (metadata replaces the whole object). URL-encode ids (`#` → `%23`). 404 / 422 invalid / 502 embedder or Chroma failure |
+| `POST /knowledge` | `{"content", "title"?}` → appended to `data/docs/Additions_N.docx` (20 per file) and ingested; returns `{file, entry, max, chunks}`. 422 empty content / 502 embedder or Chroma failure |
+| `GET /knowledge/{id}` | one chunk. URL-encode ids (`#` → `%23`). 404 unknown. No `PUT`/`DELETE` — existing content is read-only |
 
 - `type` is `academic` only when academic and nothing else; otherwise
   `non_academic`. `unknown` = classification failed.
@@ -668,6 +675,7 @@ api.py                      HTTP API (classify, answer, prepare/finalize, thread
 classifier/core.py          classify() + route(): prompt, JSON schema, thresholds
 rag/core.py                 ingest(), retrieve(), answer(), embed(), chunking, grounding
 rag/knowledge.py            knowledge_chunks table, synced to Chroma on every write
+rag/additions.py            UI additions -> data/docs/Additions_N.docx (20 per file), ingested
 rag/docx_text.py            .docx → markdown, extraction checks
 rag/format_hint.py          list-vs-prose decision
 rag/__main__.py             CLI: python -m rag {ingest|ask|check|manifest|knowledge}
