@@ -266,6 +266,91 @@ def _strip_leading_refusal(text: str) -> str:
     return text
 
 
+# A sentence-opening attribution to the source: "The documentation states
+# that ...", "According to the documentation, ...", "Based on the extracts,
+# ...". Both prompts forbid mentioning the documents, and a 9B does it anyway;
+# the enquirer should read the fact, not where the model found it. Only the
+# lead-in is removed and the rest of the sentence kept, so this never drops
+# content. Negative phrasings ("the documentation does not ...") are left
+# alone -- those are refusals or caveats, handled by refuses_in_prose.
+_SOURCE_NOUN = r"(?:(?:the|our|your|this|these|provided|available)\s+)*" \
+    r"(?:academy\s+|course\s+|training\s+|programme\s+|program\s+)?" \
+    r"(?:documentation|documents?|extracts?|materials?|information|context|sources?)"
+_ATTRIBUTION_LEADS = [
+    # "The documentation states/says/indicates/confirms/notes/mentions (that)"
+    rf"{_SOURCE_NOUN}\s+(?:clearly\s+|also\s+)?(?:states?|says?|indicates?|"
+    rf"confirms?|notes?|mentions?|specif(?:ies|y)|explains?|shows?|"
+    rf"describes?|outlines?)(?:\s+that)?[,:]?\s+",
+    # "According to / Based on / As per / Per / As stated in the documentation,"
+    rf"(?:according\s+to|based\s+on|as\s+per|per|as\s+(?:stated|described|"
+    rf"outlined|mentioned|noted)\s+in|from)\s+{_SOURCE_NOUN}\s*[,:]\s*",
+]
+_ATTRIBUTION_RE = re.compile(
+    r"(^[ \t]*(?:-[ \t]+)?|(?<=[.!?])[ \t]+|\n[ \t]*(?:-[ \t]+)?)(?:" + "|".join(_ATTRIBUTION_LEADS) + r")",
+    re.I,
+)
+
+
+def strip_source_attribution(text: str) -> str:
+    """Remove "The documentation states that" style lead-ins, capitalising the
+    word that now starts the sentence. Text without one comes back unchanged."""
+    out, pos = [], 0
+    for match in _ATTRIBUTION_RE.finditer(text):
+        out.append(text[pos : match.start()])
+        out.append(match.group(1))
+        pos = match.end()
+        if pos < len(text):
+            # Only the word the lead-in was removed from is recapitalised.
+            out.append(text[pos].upper())
+            pos += 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+# A sentence about what the source does NOT say: "The documentation does not
+# mention a discount...", "...but the extracts do not specify Y". The prompts
+# ask for gaps to be phrased to the enquirer, not about the documents, and a
+# 9B writes these anyway -- often as a bullet of its own. Narrower than
+# _SOURCE_WORD on purpose: "The kit is not provided for Level 1" and "The
+# course materials do not include a laptop" are facts, not caveats.
+_DOC_WORD = re.compile(r"\b(?:documentation|documents?|extracts?|context)\b", re.I)
+
+
+def _is_source_caveat(clause: str) -> bool:
+    return bool(_DOC_WORD.search(clause) and _SOURCE_NEGATION.search(clause))
+
+
+def _drop_caveat_sentence(sentence: str) -> str:
+    """"" if the whole sentence is a caveat; "X." if only a trailing
+    ", but <caveat>" clause is; otherwise the sentence unchanged."""
+    contrast = _CONTRAST_SPLIT.search(sentence)
+    if contrast and _is_source_caveat(sentence[contrast.end():]):
+        head = sentence[: contrast.start()].rstrip(" ,;")
+        if head and not _is_source_caveat(head):
+            return head + ("" if head[-1] in ".!?" else ".")
+    return "" if _is_source_caveat(sentence) else sentence
+
+
+def drop_source_caveats(text: str) -> str:
+    """Remove caveat sentences and bullets about the source, keeping the rest.
+    Returns "" when nothing but caveats was there."""
+    lines = []
+    for line in text.split("\n"):
+        bullet = re.match(r"^(\s*[-*•]\s+)(.*)$", line)
+        prefix, body = (bullet.group(1), bullet.group(2)) if bullet else ("", line)
+        if not body.strip():
+            lines.append(line)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", body.strip())
+        kept = [s for s in (_drop_caveat_sentence(s) for s in sentences) if s]
+        if kept:
+            lines.append(prefix + " ".join(kept))
+        elif not bullet:
+            lines.append("")
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return out
+
+
 def ground(text: str) -> str:
     """Clean a model's answer and decide what, if anything, is grounded.
 
@@ -300,7 +385,10 @@ def ground(text: str) -> str:
             return ""
     if NO_ANSWER in text:
         return ""
-    return _strip_leading_refusal(text)
+    text = strip_source_attribution(_strip_leading_refusal(text))
+    # Sixth shape: caveats about what the documents do not say, wherever they
+    # sit. Dropped; a reply made only of them is a refusal like any other.
+    return drop_source_caveats(text)
 
 SYSTEM = f"""You answer enquiries about the training programmes described in
 the documentation extracts provided.
@@ -327,8 +415,8 @@ Rules:
   as the opening clause of a longer sentence. State what the related material
   says first; only after that, in a separate trailing sentence, note the
   mismatch (for example: "...and you keep the kit after training. That is
-  what applies to the Level 2 kit specifically -- the extracts do not say
-  whether Level 3 uses the same one."). A reply that leads with what the
+  what applies to the Level 2 kit specifically; whether Level 3 uses the same
+  one is something we can confirm for you."). A reply that leads with what the
   documentation does not say is read as a refusal downstream and discarded
   outright, even when real content follows it -- so the opening sentence is
   not a style choice, it decides whether this answer reaches the enquirer at
@@ -344,7 +432,13 @@ Rules:
   something whose answer is naturally a set of items -- steps, options,
   prerequisites, dates, module names. Otherwise answer in plain prose. At most
   one short lead-in line before the list, and no section headings.
-- Do not mention "extracts", "context" or "documents" in your answer."""
+- Do not mention "extracts", "context" or "documents" in your answer, and
+  never attribute a fact to them: no "The documentation states that...",
+  "According to the documentation...", "Based on the extracts...". State the
+  fact directly, as the person who runs the training would. The same goes
+  for gaps: never write "the documentation does not mention/specify X" -- if
+  part of the question is not covered, leave it out or say it is something
+  we can confirm for them."""
 
 # Used instead of SYSTEM when a thread history is supplied. The two extra rules
 # close the hole history opens: a model shown a previous reply will happily

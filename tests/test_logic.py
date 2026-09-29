@@ -107,12 +107,54 @@ class TestGround(unittest.TestCase):
             ("The documentation does not specify pricing for this course.", ""),
             ("The documentation does not specify this. OK.", ""),
             (f"Level 1 covers networking. {NO_ANSWER}", "Level 1 covers networking."),
-            (caveat, caveat),  # honest caveat is not a refusal
+            # a real fact with a source caveat welded on: keep the fact only
+            (caveat, "Level 1 does not include hands-on exercises."),
             (answer_text, answer_text),
             # leading refusal(s) followed by real content: salvage the content
             ("The documentation does not specify a kit for Level 3. " + answer_text, answer_text),
             ("The documentation does not specify this. The extracts do not "
              "mention it either. " + answer_text, answer_text),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw[:50]):
+                self.assertEqual(ground(raw), expected)
+
+    def test_source_attribution_stripped(self):
+        cases = [
+            ('The documentation states that for ACP Level 1 "Foundation" training, '
+             "no prior knowledge is required.",
+             'For ACP Level 1 "Foundation" training, no prior knowledge is required.'),
+            ("Level 1 is for beginners. According to the documentation, Level 2 "
+             "builds on it.",
+             "Level 1 is for beginners. Level 2 builds on it."),
+            ("- The documentation says that CAN bus is covered\n"
+             "- Based on the course materials, Lab setup is included",
+             "- CAN bus is covered\n- Lab setup is included"),
+            ("Per the documentation: the course lasts three days.",
+             "The course lasts three days."),
+            # not an attribution lead-in: left alone
+            ("The course materials include a hardware kit.",
+             "The course materials include a hardware kit."),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw[:50]):
+                self.assertEqual(ground(raw), expected)
+
+    def test_source_caveats_dropped(self):
+        cases = [
+            ("- Level 1 is priced at €890.\n"
+             "- The documentation does not mention a discount for booking both.\n"
+             "- A tailored quote can be provided on request.",
+             "- Level 1 is priced at €890.\n"
+             "- A tailored quote can be provided on request."),
+            ("Level 1 costs €890. The documentation does not mention discounts.",
+             "Level 1 costs €890."),
+            ("Level 1 has no exams, but the documentation does not specify "
+             "whether handouts are allowed.",
+             "Level 1 has no exams."),
+            # nothing but caveats: ungrounded, goes to a human
+            ("The documentation does not mention discounts. The extracts do "
+             "not specify dates.", ""),
         ]
         for raw, expected in cases:
             with self.subTest(raw=raw[:50]):
