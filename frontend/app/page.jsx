@@ -6,9 +6,10 @@ import HistoryRow from "../components/HistoryRow";
 import RowHeader from "../components/RowHeader";
 import ThreadCard from "../components/ThreadCard";
 import KnowledgeView from "../components/KnowledgeView";
-import { fetchHistory, fetchQueue } from "../lib/api";
+import { fetchHistory, fetchManual, fetchQueue } from "../lib/api";
 
 const REVIEW_LABELS = ["Received / drafted", "Enquiry", "AI reply", "Edit & send"];
+const MANUAL_LABELS = ["Received", "Enquiry", "AI reply", "Write & send"];
 const HISTORY_LABELS = ["Received / sent", "Enquiry", "AI reply", "Sent"];
 
 const POLL_MS = 20000;
@@ -46,7 +47,8 @@ function clusterBySender(groups) {
 // at exactly /review, and a second page would need its own FastAPI route.
 function tabFromHash() {
   if (typeof window === "undefined") return "review";
-  return window.location.hash === "#knowledge" ? "knowledge" : "review";
+  if (window.location.hash === "#knowledge") return "knowledge";
+  return window.location.hash === "#manual" ? "manual" : "review";
 }
 
 export default function Page() {
@@ -55,6 +57,12 @@ export default function Page() {
   // -- one card per thread, not one row per reply. See lib/api.js.
   const [groups, setGroups] = useState([]);
   const [historyGroups, setHistoryGroups] = useState([]);
+  // Enquiries with no AI reply (the workflow's Human queue): same card/row
+  // components, on their own tab, with an empty draft to write into.
+  const [manualGroups, setManualGroups] = useState([]);
+  // Manual rows just sent, kept on screen until their own timeout removes
+  // them, so a poll cannot wipe the result message mid-read.
+  const manualHeldRef = useRef(new Map());
   const [error, setError] = useState(null);
   const [dryRun, setDryRun] = useState(false);
   // Exchanges mid Send -> fade-out, keyed by exchange id. A poll landing in
@@ -67,10 +75,24 @@ export default function Page() {
 
   const load = useCallback(async () => {
     try {
-      const [{ groups: freshGroups, dryRun }, historyRows] = await Promise.all([
+      const [{ groups: freshGroups, dryRun }, historyRows, manualRows] = await Promise.all([
         fetchQueue(),
         fetchHistory(),
+        fetchManual(),
       ]);
+      setManualGroups(() => {
+        const merged = manualRows.map((g) => ({ ...g, exchanges: [...g.exchanges] }));
+        for (const [exchangeId, held] of manualHeldRef.current) {
+          if (merged.some((g) => g.exchanges.some((e) => e.id === exchangeId))) continue;
+          let group = merged.find((g) => g.conversation_id === held.group.conversation_id);
+          if (!group) {
+            group = { ...held.group, exchanges: [] };
+            merged.push(group);
+          }
+          group.exchanges.push(held.exchange);
+        }
+        return merged;
+      });
       setError(null);
       setDryRun(dryRun);
       setHistoryGroups(historyRows);
@@ -113,7 +135,7 @@ export default function Page() {
   }, []);
 
   function switchTab(next) {
-    window.location.hash = next === "knowledge" ? "knowledge" : "";
+    window.location.hash = next === "review" ? "" : next;
     setTab(next);
   }
 
@@ -139,7 +161,13 @@ export default function Page() {
     load(); // pulls the just-sent exchange into History right away, not on the next 20s tick
   }
 
+  function handleManualRemove(exchangeId) {
+    manualHeldRef.current.delete(exchangeId);
+    load();
+  }
+
   const pendingCount = totalExchanges(groups);
+  const manualCount = totalExchanges(manualGroups);
 
   return (
     <div className="wrap">
@@ -160,6 +188,15 @@ export default function Page() {
           <button
             type="button"
             role="tab"
+            aria-selected={tab === "manual"}
+            className={"tab" + (tab === "manual" ? " active" : "")}
+            onClick={() => switchTab("manual")}
+          >
+            Manual replies{manualCount ? <span className="tab-count">{manualCount}</span> : null}
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={tab === "knowledge"}
             className={"tab" + (tab === "knowledge" ? " active" : "")}
             onClick={() => switchTab("knowledge")}
@@ -176,6 +213,40 @@ export default function Page() {
       </header>
 
       {tab === "knowledge" && <KnowledgeView />}
+
+      {tab === "manual" && (
+        <section>
+          <h2 className="section-title">Not answered by the documents — write the reply</h2>
+          {error && (
+            <div id="loadError">Could not load the manual queue: {error}</div>
+          )}
+          {!error && manualGroups.length === 0 && (
+            <div id="empty">Nothing needs a manual reply.</div>
+          )}
+          {manualGroups.map((group) => (
+            <ThreadCard
+              key={group.conversation_id}
+              subject={group.conversation_subject}
+              conversationId={group.conversation_id}
+              senderEmail={group.sender_email}
+              otherOpenThreads={group.other_open_threads}
+              otherSentThreads={group.other_sent_threads}
+            >
+              <RowHeader labels={MANUAL_LABELS} />
+              {group.exchanges.map((exchange) => (
+                <ReviewRow
+                  key={exchange.id}
+                  row={exchange}
+                  onSendSuccess={(sentExchange) =>
+                    manualHeldRef.current.set(sentExchange.id, { group, exchange: sentExchange })
+                  }
+                  onRemove={handleManualRemove}
+                />
+              ))}
+            </ThreadCard>
+          ))}
+        </section>
+      )}
 
       {tab === "review" && (<>
       <section>

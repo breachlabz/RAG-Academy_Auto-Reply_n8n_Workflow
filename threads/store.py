@@ -670,6 +670,73 @@ def sent_history(
     return [dict(row) for row in rows]
 
 
+# --- Manual queue ---------------------------------------------------------
+#
+# An email the classifier let through but the documents could not answer
+# ("Human queue" in the workflow). There is no AI reply to review, so a person
+# writes one from scratch on the review page's Manual tab. `reply` stays NULL
+# while the row waits -- the turn is still unanswered, which is what the
+# near-duplicate check and the thread history rely on -- and the row is told
+# apart from any other unanswered turn by `grounded = 0` plus the n8n
+# `resume_url` its Send needs.
+
+
+def queue_manual(
+    exchange_id: int,
+    resume_url: str,
+    *,
+    subject: str = "",
+    path: pathlib.Path | None = None,
+) -> None:
+    """Put an unanswerable enquiry on the manual queue."""
+    with connect(path) as conn:
+        conn.execute(
+            """UPDATE exchanges
+                  SET grounded = 0, resume_url = ?, reply_subject = ?
+                WHERE id = ? AND reply IS NULL AND sent = 0 AND is_followup = 0""",
+            (resume_url, subject or "", exchange_id),
+        )
+
+
+def pending_manual(*, path: pathlib.Path | None = None) -> list[dict]:
+    """Enquiries waiting for a hand-written reply, oldest first."""
+    with connect(path) as conn:
+        rows = conn.execute(
+            """SELECT e.*, c.subject AS conversation_subject, c.sender_email AS conversation_sender_email
+                 FROM exchanges e
+                 JOIN conversations c USING (conversation_id)
+                WHERE e.grounded = 0 AND e.reply IS NULL AND e.resume_url IS NOT NULL
+                  AND e.sent = 0 AND e.is_followup = 0
+                ORDER BY e.id"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_manual_reply(
+    exchange_id: int,
+    reply: str,
+    *,
+    attachment_name: str | None = None,
+    path: pathlib.Path | None = None,
+) -> bool:
+    """Store the hand-written reply and take the row off the manual queue.
+
+    It becomes the turn's `reply` as well as its `edited_reply`: there was no
+    AI draft, and the thread history shown to the next email has to carry
+    what was actually answered. `grounded` stays 0, which is how the review
+    page knows the text was written by a person. True when a row was updated.
+    """
+    with connect(path) as conn:
+        cur = conn.execute(
+            """UPDATE exchanges
+                  SET reply = ?, edited_reply = ?, replied_at = ?, sent = 1,
+                      sent_at = ?, attachment_name = ?
+                WHERE id = ? AND sent = 0 AND reply IS NULL""",
+            (reply, reply, _now(), _now(), attachment_name, exchange_id),
+        )
+        return cur.rowcount > 0
+
+
 def get_exchange(exchange_id: int, *, path: pathlib.Path | None = None) -> dict | None:
     with connect(path) as conn:
         row = conn.execute(

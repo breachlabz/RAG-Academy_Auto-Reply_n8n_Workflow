@@ -125,7 +125,7 @@
         }
       },
       "id": "ai-agent",
-      "name": "AI Agent \u2014 generate reply",
+      "name": "AI Agent — generate reply",
       "type": "@n8n/n8n-nodes-langchain.agent",
       "typeVersion": 3.1,
       "position": [
@@ -283,7 +283,7 @@
         }
       },
       "id": "record-reply",
-      "name": "Record reply",
+      "name": "Queue for review (UI)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
@@ -291,7 +291,7 @@
         -96
       ],
       "onError": "continueRegularOutput",
-      "notes": "The other half of the memory: without it the store keeps the enquirer's questions and none of the answers, and the next email is shown a conversation in which nobody replied.\n\nQueues the reply for a human at /review instead of creating an Outlook draft. Nothing sends until a person reviews it there and clicks Send (mail/graph.py). `resume_url` is this execution's Wait-node resume webhook (see Wait for review, next) -- /review/{id}/send POSTs to it once the human sends, so this execution doesn't just fire-and-forget."
+      "notes": "The review page step. Stores the grounded reply on the thread and queues it at /review, where a person reads and edits it; also saves this execution's resume link so the page's Send can wake the Wait node (next). Without it the store keeps the enquirer's questions and none of the answers, and the next email is shown a conversation in which nobody replied."
     },
     {
       "parameters": {
@@ -321,7 +321,7 @@
         "url": "http://classifier:8100/emails/finalize",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ output: $json.output || '', subject: $('Prepare').item.json.subject || '', conversation_id: $('Prepare').item.json.conversation_id, format: $('Prepare').item.json.format, exchange_id: $('Prepare').item.json.exchange_id }) }}",
+        "jsonBody": "={{ JSON.stringify({ output: $json.output || '', subject: $('Prepare').item.json.subject || '', conversation_id: $('Prepare').item.json.conversation_id, format: $('Prepare').item.json.format, exchange_id: $('Prepare').item.json.exchange_id, searched: ($json.intermediateSteps || []).length > 0 }) }}",
         "options": {
           "timeout": 60000
         }
@@ -335,10 +335,19 @@
         144
       ],
       "onError": "continueRegularOutput",
-      "notes": "Everything decidable once the answer exists: was it grounded, and what does the draft read like.\n\nBoth halves used to live in this canvas -- the refusal test as two regexes inside an IF condition, the greeting and sign-off as string concatenation in a Code node. Both were copies of rag.core, and a copied safety check is one that will eventually disagree with itself. They are now one implementation, covered by scripts/rag_eval.py.\n\nThe refusal test is deliberately two nets: the NOT_IN_DOCUMENTS token leaks. Measured on seven unanswerable questions the 9B emitted the token for four and answered the other three in prose -- 'the provided documentation does not specify how many days' -- a well-formed answer that says nothing. `reason` distinguishes them, so you can tell a corpus gap from a model that will not say so.\n\nThe shell is assembled here and never by the model. Retrieval grounds the factual body; letting the model write the courtesy around it reopens the gap it was stopped from filling ('we look forward to seeing you at our campus')."
+      "notes": "Everything decidable once the answer exists: was it grounded, and what does the draft read like.\n\nBoth halves used to live in this canvas -- the refusal test as two regexes inside an IF condition, the greeting and sign-off as string concatenation in a Code node. Both were copies of rag.core, and a copied safety check is one that will eventually disagree with itself. They are now one implementation, covered by scripts/rag_eval.py.\n\nThe refusal test is deliberately two nets: the NOT_IN_DOCUMENTS token leaks. Measured on seven unanswerable questions the 9B emitted the token for four and answered the other three in prose -- 'the provided documentation does not specify how many days' -- a well-formed answer that says nothing. `reason` distinguishes them, so you can tell a corpus gap from a model that will not say so.\n\nThe shell is assembled here and never by the model. Retrieval grounds the factual body; letting the model write the courtesy around it reopens the gap it was stopped from filling ('we look forward to seeing you at our campus').\n\n`searched` tells the API whether the agent called academy_docs at all (intermediateSteps is non-empty). A reply written with no search is never grounded -- the model skipped the tool and answered from its own head -- so it goes to Human queue with reason 'the agent answered without searching the documents'. Needs 'Return Intermediate Steps' switched on in the AI Agent node."
     },
     {
-      "parameters": {},
+      "parameters": {
+        "resume": "webhook",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 14,
+        "resumeUnit": "days",
+        "options": {}
+      },
       "id": "wait-for-review",
       "name": "Wait for review",
       "type": "n8n-nodes-base.wait",
@@ -348,7 +357,70 @@
         -96
       ],
       "webhookId": "2948b21a-ab10-43e5-952b-f80aeb1317ce",
-      "notes": "Holds the execution open until a human approves on /review and clicks Send -- review_send() in api.py POSTs to $execution.resumeUrl (captured by Record reply, previous node) once the Graph send actually succeeds. Capped at 14 days (limitWaitTime/resumeAmount below): past that, n8n auto-resumes and this execution just ends -- the reply is still sitting in the review queue, sendable by hand any time regardless of this workflow's state."
+      "notes": "Holds the execution open until a human approves on /review and clicks Send -- review_send() in api.py POSTs the final reply to $execution.resumeUrl (captured by Queue for review (UI), previous node), and the two nodes after it run on that text: Record final draft, then Outlook Draft. Resume = On Webhook Call (POST), capped at 14 days (limitWaitTime/resumeAmount): past that the execution resumes with no body and the reply can no longer be drafted from /review. Respond = When Last Node Finishes: the API's Send call gets its answer only after both have run, so a failed draft is reported to the reviewer (the reply itself is recorded either way). NOTE: with empty parameters this node defaults to a 5-second timer and does not wait at all."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://classifier:8100/review/{{ $('Wait for review').item.json.body.exchange_id }}/drafted",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ reply: $('Wait for review').item.json.body.reply, attachment_name: ($('Wait for review').item.json.body.attachment || {}).name || null }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "record-draft",
+      "name": "Record final draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2320,
+        -208
+      ],
+      "notes": "Records the reviewer's final text (from the Wait node) and marks the row sent on /review, via /review/{id}/drafted. It does NOT depend on Outlook Draft: it sits above it on the canvas, n8n runs the branches after the Wait top to bottom, so this runs first and the reply is recorded whether or not the draft could be created. A failed draft is reported to the reviewer as a warning on the review page."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.microsoft.com/v1.0/me/messages/{{ $json.body.ref }}/createReply",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "microsoftOutlookOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify(Object.assign({ comment: $json.body.reply }, $json.body.attachment ? { message: { attachments: [{ '@odata.type': '#microsoft.graph.fileAttachment', name: $json.body.attachment.name, contentType: $json.body.attachment.content_type, contentBytes: $json.body.attachment.content_b64 }] } } : {})) }}",
+        "options": {}
+      },
+      "id": "outlook-draft",
+      "name": "Outlook Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2320,
+        16
+      ],
+      "notes": "Runs when the reviewer clicks Send on /review: the Wait node's output is the JSON the API posted -- { exchange_id, reply, ref, subject } -- and this turns `reply` into a reply DRAFT in the mailbox, threaded on the original (`ref`) with the original quoted beneath. A person opens it in Outlook and presses Send. Nothing in this workflow sends mail.\n\ncreateReply through the Microsoft Outlook OAuth2 credential the trigger uses (needs Mail.ReadWrite) -- not the Outlook node's Message > Reply operation, which sends immediately unless its 'Save as Draft' option is on.\n\nKeep this the LOWEST node after the Wait: it is the one that can fail, and a failure stops the execution, so anything placed below it would not run.\n\nIf the reviewer attached a file on /review it arrives as `attachment` { name, content_type, content_b64 } and is added to the draft in the same call (under 3 MB; the API enforces the limit)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://classifier:8100/review/manual",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ exchange_id: $('Finalize').item.json.exchange_id, resume_url: $execution.resumeUrl, subject: $('Prepare').item.json.subject || '' }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "queue-manual",
+      "name": "Queue for manual reply (UI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1664,
+        304
+      ],
+      "notes": "The Human queue is no longer a dead end. An email the documents could not answer is put on the review page's Manual replies tab (/review#manual) with NO AI reply: a person writes the reply there and clicks Send. From then on it is the same path as a reviewed reply -- this execution waits at Wait for review, and Record final draft and Outlook Draft run on the text the person wrote. The API also adds that hand-written reply to the knowledge base, so the next enquiry on the same point can be answered from it."
     }
   ],
   "connections": {
@@ -389,7 +461,7 @@
       "main": [
         [
           {
-            "node": "AI Agent \u2014 generate reply",
+            "node": "AI Agent — generate reply",
             "type": "main",
             "index": 0
           }
@@ -403,55 +475,11 @@
         ]
       ]
     },
-    "Local Model": {
-      "ai_languageModel": [
-        [
-          {
-            "node": "AI Agent \u2014 generate reply",
-            "type": "ai_languageModel",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "academy_docs": {
-      "ai_tool": [
-        [
-          {
-            "node": "AI Agent \u2014 generate reply",
-            "type": "ai_tool",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Embeddings bge-m3": {
-      "ai_embedding": [
-        [
-          {
-            "node": "academy_docs",
-            "type": "ai_embedding",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "AI Agent \u2014 generate reply": {
-      "main": [
-        [
-          {
-            "node": "Finalize",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Grounded answer?": {
       "main": [
         [
           {
-            "node": "Record reply",
+            "node": "Queue for review (UI)",
             "type": "main",
             "index": 0
           }
@@ -487,12 +515,94 @@
         ]
       ]
     },
-    "Record reply": {
+    "Queue for review (UI)": {
       "main": [
         [
           {
             "node": "Wait for review",
             "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for review": {
+      "main": [
+        [
+          {
+            "node": "Record final draft",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Outlook Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human queue": {
+      "main": [
+        [
+          {
+            "node": "Queue for manual reply (UI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Queue for manual reply (UI)": {
+      "main": [
+        [
+          {
+            "node": "Wait for review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent — generate reply": {
+      "main": [
+        [
+          {
+            "node": "Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Local Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent — generate reply",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "academy_docs": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent — generate reply",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings bge-m3": {
+      "ai_embedding": [
+        [
+          {
+            "node": "academy_docs",
+            "type": "ai_embedding",
             "index": 0
           }
         ]

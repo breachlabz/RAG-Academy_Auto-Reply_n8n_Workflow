@@ -2,14 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import ClampedText from "./ClampedText";
-import { addContent, fetchChunks } from "../lib/knowledge";
+import { addContent, EXPORT_URL, fetchChunks } from "../lib/knowledge";
 
 const POLL_MS = 20000;
 
 // The Knowledge tab: an "Add context" box, then a compact read-only list of
 // what is already in the knowledge base. Each new entry is appended to the
 // current data/docs/Additions_N.docx (20 per file) and ingested like any
-// other document. Existing content cannot be edited or deleted here.
+// other document. Existing content cannot be edited or deleted here; "Export
+// JSON" downloads all of it (every entry, whatever the search box says).
 export default function KnowledgeView() {
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
@@ -98,6 +99,9 @@ export default function KnowledgeView() {
       <div className="kn-list-head">
         <h2 className="section-title">Already added</h2>
         <span className="count">{visible.length} of {chunks.length}</span>
+        <a className="kn-export" href={EXPORT_URL} download title="Download all knowledge base content as a JSON file">
+          Export JSON
+        </a>
         <input
           type="search"
           className="kn-input kn-filter"

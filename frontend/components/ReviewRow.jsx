@@ -26,7 +26,7 @@ function fmtDate(iso) {
 // edit or an expanded preview is never reset out from under the reviewer by
 // a background refresh.
 export default function ReviewRow({ row, onSendSuccess, onRemove }) {
-  const [text, setText] = useState(row.reply || "");
+  const [text, setText] = useState(row.reply || row.prefill || "");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState(null); // { kind: "ok" | "error", message }
   const [sent, setSent] = useState(false);
@@ -99,13 +99,34 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
     setStatus(null);
     try {
       const result = await sendReply(row.id, text, attachment);
+      // Recording does not depend on the Outlook draft: a reply can be
+      // recorded while the draft failed, and the reviewer has to be told.
+      const draftFailed = !!result.draft_error;
+      // A hand-written reply (Manual tab) is also added to the knowledge
+      // base; say where it went, or that it did not go.
+      const k = result.knowledge;
+      const knowledgeFailed = !!(k && k.error);
+      const knowledgeNote = !k
+        ? ""
+        : k.error
+          ? ` NOT added to the knowledge base: ${k.error}`
+          : ` Added to the knowledge base (${k.file}, entry ${k.entry}).`;
+      // The reply is recorded either way, so a missing Outlook draft is not
+      // reported here at all, on either tab: Send just says "Recorded." and
+      // the failed draft shows in n8n's Executions. Red is kept for a
+      // reply that could not be recorded (the catch below) or a knowledge
+      // entry that could not be saved.
       setStatus({
-        kind: "ok",
-        message: result.dry_run ? "Recorded (dry run — nothing sent)." : "Sent.",
+        kind: knowledgeFailed ? "error" : "ok",
+        message:
+          (draftFailed
+            ? "Recorded."
+            : result.dry_run ? "Recorded (dry run — no draft created)." : "Draft created in Outlook — send it from there.") +
+          knowledgeNote,
       });
       setSent(true);
       onSendSuccess(row); // tells the poll not to drop this row mid fade-out
-      setTimeout(() => onRemove(row.id), 800);
+      setTimeout(() => onRemove(row.id), knowledgeFailed ? 8000 : k ? 4000 : 800);
     } catch (e) {
       setStatus({ kind: "error", message: e.message });
       setBusy(false);
@@ -138,7 +159,13 @@ export default function ReviewRow({ row, onSendSuccess, onRemove }) {
       </div>
 
       <div className="col">
-        <ClampedText text={row.reply || ""} />
+        {row.manual ? (
+          <div className="edited-note">
+            No AI reply — the documents did not cover this. Write the reply by hand; it will also be added to the knowledge base.
+          </div>
+        ) : (
+          <ClampedText text={row.reply || ""} />
+        )}
       </div>
 
       <div className="col edit-cell">

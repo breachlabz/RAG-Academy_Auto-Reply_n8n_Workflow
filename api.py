@@ -13,8 +13,11 @@ n8n cannot import the Python module, so it talks to this over HTTP instead.
     GET  /threads/{id}    one conversation's turns (query/reply pairs)
     GET  /review          the review queue UI (open this in a browser)
     GET  /review/queue    grounded replies awaiting review, as JSON
+    GET  /review/manual   enquiries the documents could not answer, awaiting a hand-written reply
+    POST /review/manual   {"exchange_id", "resume_url"} -> put one on that queue (the workflow)
     GET  /review/history  already-sent replies, most recent first, as JSON
-    POST /review/{id}/send  {"reply": "..."}  -> send it (Graph) and record it
+    POST /review/{id}/send  {"reply": "..."}  -> hand it to n8n (Outlook draft)
+    POST /review/{id}/drafted {"reply": "..."} -> the workflow's last node: draft exists, record it
     GET  /knowledge       knowledge chunks (content + JSON metadata), read-only
     POST /knowledge       {"content": ..., "title"?: ...} -> append to Additions_N.docx
     GET  /knowledge/{id}  one chunk
@@ -30,8 +33,9 @@ never reached for it.
 
 /threads/reply is the workflow's last node now -- there is no Outlook Draft
 step. A grounded reply lands in the review queue (/review) instead: a human
-reads it, edits it if needed, and Send calls Graph directly (mail/graph.py) to
-actually send it, then records the sent text back onto the row.
+reads it, edits it if needed, and Send resumes the workflow's Wait node with
+the final text; the Outlook Draft node after it creates the reply draft in the
+mailbox, and the final text is recorded back onto the row.
 
 /answer and /generate-reply are the same pipeline; the difference is memory.
 /answer is stateless and stays that way -- it is what the test form calls and
@@ -54,17 +58,18 @@ from __future__ import annotations
 
 import base64
 import binascii
+import datetime
+import json
 import os
 import pathlib
 
 import requests
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from classifier import DEFAULT_THRESHOLD, classify, route
-from mail import graph as mail_graph
 from mail import to_plain_text
 from rag import answer as rag_answer
 from rag import answer_followup
@@ -73,6 +78,7 @@ from rag import resolve_format
 from rag import additions as rag_additions
 from rag import knowledge as rag_knowledge
 from rag.core import COLLECTION as RAG_COLLECTION
+from rag.core import EMAIL_CLOSER_ANSWERED, EMAIL_GREETING, EMAIL_SIGNOFF
 from rag.core import EMAIL_SUBJECT, format_email, ground
 from rag.format_hint import as_bullets, wants_list
 from threads import context as thread_context
@@ -197,7 +203,13 @@ class FinalizeRequest(BaseModel):
     list-shaped enquiry in one paragraph anyway; anything else leaves it alone.
 
     `exchange_id` is also `/emails/prepare`'s, echoed straight through to the
-    response so Record reply can pass it to /threads/reply unchanged.
+    response so Queue for review (UI) can pass it to /threads/reply unchanged.
+
+    `searched` is whether the agent called its academy_docs tool at least once
+    (the node sends `intermediateSteps.length > 0`). False means the model
+    skipped retrieval and wrote the reply from its own head, which is never
+    grounded however plausible it reads. None -- an older workflow that does
+    not send the field -- leaves the decision to the text checks alone.
     """
 
     output: str
@@ -205,6 +217,7 @@ class FinalizeRequest(BaseModel):
     conversation_id: str | None = None
     format: str = "prose"
     exchange_id: int | None = None
+    searched: bool | None = None
 
 
 class RecordReplyRequest(BaseModel):
@@ -483,8 +496,8 @@ def prepare_email(req: PrepareRequest) -> dict:
     on), `history` / `email_text` / `query` / `format` (the agent's prompt),
     and `subject` / `conversation_id` / `ref` (carried through to finalize and
     the thread record; `ref` ends up on the stored exchange row for the
-    review queue's Graph reply call later). `exchange_id` is the row
-    `record_inbound` just opened -- Finalize and Record reply must carry it
+    Outlook Draft node's reply call later). `exchange_id` is the row
+    `record_inbound` just opened -- Finalize and Queue for review (UI) must carry it
     through unchanged so the eventual reply lands on this exact row instead
     of record_reply's "most recent unanswered" fallback guess.
 
@@ -585,11 +598,30 @@ def finalize_email(req: FinalizeRequest) -> dict:
 
     `grounded` is the field the "Grounded answer?" node branches on. When true,
     `reply` is the ready-to-send draft (greeting, the agent's body, sign-off);
-    when false it is empty and the email is left for a human. Nothing is
+    when false it is empty and the email is left for a human. A draft that
+    admits the documents are silent on what the enquirer asked is also false,
+    even when other facts surround the admission, and so is any draft the
+    agent wrote without searching the documentation (`searched: false`).
+    Nothing is
     written here -- the workflow records the reply only after the Outlook draft
     exists, through /threads/reply.
     """
-    body = ground(req.output)
+    # The enquiry itself, so `ground` can tell an admission about a side
+    # detail (dropped, rest kept) from one about what was actually asked
+    # (ungrounded -> Human queue). Read back by exchange_id rather than taken
+    # from the request, so the workflow's Finalize node needs no new field.
+    exchange = thread_store.get_exchange(req.exchange_id) if req.exchange_id else None
+    body = ground(req.output, question=(exchange or {}).get("query") or "")
+    reason = "ok" if body else "no grounded answer in the documents"
+
+    # A reply written without a single documentation search cannot be grounded
+    # in it. The agent's prompt says it MUST search first; a 9B skips the tool
+    # now and then and states invented specifics in the same confident shape
+    # as a real answer ("90 minutes, 40 questions" for an exam the documents
+    # give as 30 and 30), which no check on the wording can tell apart.
+    if body and req.searched is False:
+        body = ""
+        reason = "the agent answered without searching the documents"
     grounded = bool(body)
 
     # Coercion net: the agent is asked for a bulleted reply when the enquirer
@@ -608,7 +640,7 @@ def finalize_email(req: FinalizeRequest) -> dict:
         "answer": body,
         "reply": format_email(body, answered=True) if grounded else "",
         "agent_output": req.output,
-        "reason": "ok" if grounded else "no grounded answer in the documents",
+        "reason": reason,
     }
 
 
@@ -728,7 +760,7 @@ def process_followups() -> dict:
 # --- Review queue -------------------------------------------------------
 #
 # The human-in-the-loop step that replaces the Outlook-draft-then-manually-
-# send flow. `Record reply` (/threads/reply above) already writes a grounded
+# send flow. `Queue for review (UI)` (/threads/reply above) already writes a grounded
 # reply onto its exchange row; this is what surfaces those rows to a person,
 # and what actually sends once they approve -- through mail.graph, not
 # through n8n, since the Outlook OAuth2 credential the workflow would have
@@ -740,10 +772,10 @@ class SendReplyRequest(BaseModel):
     """`/review/{id}/send` -- the reviewer's final text for one exchange.
 
     The three attachment_* fields are all optional and all-or-nothing (one
-    file, see mail.graph.Attachment). content_b64 is the file read client-side
-    with FileReader -- it lives in this request only: review_send passes the
-    decoded bytes straight to mail_graph.send_reply and never writes them to
-    disk or the DB, only attachment_name survives, onto the row's history.
+    file). content_b64 is the file read client-side with FileReader -- it
+    lives in this request only: review_send passes it on to n8n for the
+    Outlook draft and never writes it to disk or the DB, only attachment_name
+    survives, onto the row's history.
     """
 
     reply: str
@@ -754,7 +786,12 @@ class SendReplyRequest(BaseModel):
 
 @app.get("/review")
 def review_page() -> FileResponse:
-    return FileResponse(_REVIEW_DIST / "index.html")
+    # no-cache: the page names its scripts by content hash, so a browser that
+    # reuses an old copy of this file keeps running the previous build's code
+    # after a deploy. Revalidating it on every load costs one tiny request.
+    return FileResponse(
+        _REVIEW_DIST / "index.html", headers={"Cache-Control": "no-cache"}
+    )
 
 
 def _group_by_conversation(rows: list[dict]) -> list[dict]:
@@ -824,6 +861,82 @@ def review_queue() -> dict:
     return {"pending": _group_by_conversation(pending), "dry_run": REVIEW_DRY_RUN}
 
 
+class QueueManualRequest(BaseModel):
+    """`POST /review/manual` -- the workflow's "Queue for manual reply (UI)"
+    node, on the Human queue branch: the documents had no grounded answer."""
+
+    exchange_id: int
+    resume_url: str
+    subject: str = ""
+
+
+@app.post("/review/manual")
+def review_manual_add(req: QueueManualRequest) -> dict:
+    if thread_store.get_exchange(req.exchange_id) is None:
+        raise HTTPException(404, "no such exchange")
+    thread_store.queue_manual(req.exchange_id, req.resume_url, subject=req.subject)
+    return {"ok": True, "id": req.exchange_id}
+
+
+@app.get("/review/manual")
+def review_manual() -> dict:
+    """Enquiries with no AI reply, waiting for a person to write one. Same
+    shape as /review/queue. `prefill` is the empty email shell (greeting,
+    closing line, sign-off) the edit box starts from."""
+    pending = thread_store.pending_manual()
+    for row in pending:
+        if not row.get("query_gist"):
+            row["query_gist"] = thread_gist.summarize_query(row["query"])
+            thread_store.set_query_gist(row["id"], row["query_gist"])
+        row["manual"] = True
+        row["prefill"] = format_email("", answered=True)
+    return {"pending": _group_by_conversation(pending), "dry_run": REVIEW_DRY_RUN}
+
+
+def _is_manual(row: dict) -> bool:
+    """On the manual queue: no AI reply, and an n8n execution waiting."""
+    return not row["grounded"] and row["reply"] is None and bool(row["resume_url"])
+
+
+def _record_final(row: dict, reply: str, attachment_name: str | None) -> None:
+    """Mark a row sent with the reviewer's final text."""
+    if row["reply"] is None:
+        thread_store.record_manual_reply(row["id"], reply, attachment_name=attachment_name)
+    else:
+        thread_store.mark_sent(row["id"], reply, attachment_name=attachment_name)
+
+
+def _body_without_shell(reply: str) -> str:
+    """The reply minus the greeting, closing line and sign-off, so what goes
+    into the knowledge base is the answer and not the courtesy around it."""
+    body = reply.strip()
+    if body.startswith(EMAIL_GREETING):
+        body = body[len(EMAIL_GREETING):].strip()
+    if body.endswith(EMAIL_SIGNOFF):
+        body = body[: -len(EMAIL_SIGNOFF)].strip()
+    if body.endswith(EMAIL_CLOSER_ANSWERED):
+        body = body[: -len(EMAIL_CLOSER_ANSWERED)].strip()
+    return body
+
+
+def _learn_from_manual(row: dict, reply: str) -> dict:
+    """Add a hand-written reply to the knowledge base, exactly as the
+    Knowledge page's "Add content" does (rag.additions), so the next enquiry
+    on the same point can be answered from it. The entry is the question's
+    one-line gist as its title and the reply body under it -- never the
+    enquirer's own email text. Never raises: the reply is already recorded,
+    and a knowledge failure must not undo or hide that."""
+    body = _body_without_shell(reply)
+    if not body:
+        return {"error": "the reply has no body besides the greeting and sign-off"}
+    gist = row.get("query_gist") or thread_gist.summarize_query(row["query"])
+    try:
+        added = rag_additions.add(f"Question: {gist}\n\nAnswer: {body}", gist)
+    except Exception as exc:  # embedder or Chroma unreachable/rejected
+        return {"error": str(exc)}
+    return {"file": added["file"], "entry": added["entry"]}
+
+
 @app.get("/review/history")
 def review_history() -> dict:
     """Already-sent replies, grouped by conversation, most recently sent
@@ -831,87 +944,132 @@ def review_history() -> dict:
     return {"history": _group_by_conversation(thread_store.sent_history())}
 
 
-# UI-only testing escape hatch: skip the real Graph call so the queue/edit/
-# Send flow (and the DB write it makes) can be exercised without GRAPH_* set
-# up, and without sending real mail while that's being tested. Off by
+# UI-only testing escape hatch: skip the hand-off to n8n so the queue/edit/
+# Send flow (and the DB write it makes) can be exercised without the Outlook
+# credential set up, and without creating real drafts while that's tested. Off by
 # default -- REVIEW_DRY_RUN must be explicitly set to turn it on, and every
 # dry-run response says so (`dry_run: true`), so it is never mistaken for a
 # real send in the UI or in a log. Remove/unset it once you're done testing.
+# Graph refuses a file over ~3MB on the same-call attachment path the Outlook
+# Draft node uses. Checked on the decoded bytes, not the base64 text.
+MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024
+
 REVIEW_DRY_RUN = os.environ.get("REVIEW_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 
 @app.post("/review/{exchange_id}/send")
 def review_send(exchange_id: int, req: SendReplyRequest) -> dict:
-    """Send the reviewer's (possibly edited) reply for real, then record it.
+    """Hand the reviewer's (possibly edited) reply to n8n, then record it.
 
-    The Graph call comes first, on the row still in the queue: a failed send
-    leaves the row exactly where it was, so the reviewer sees the error and
-    can retry, rather than the row silently vanishing without the mail having
-    gone anywhere. Only a successful send marks it sent.
+    n8n records the final text and leaves it as a reply draft in the mailbox,
+    where a person presses Send. `sent` on the row means "approved on the
+    review page and recorded" -- the draft is attempted but the record does
+    not wait on it; `draft_error` in the response says when it failed.
 
     Skipped entirely when REVIEW_DRY_RUN is set -- see the comment above.
     """
     row = thread_store.get_exchange(exchange_id)
     if row is None:
         raise HTTPException(404, "no such exchange")
-    if not row["grounded"] or row["reply"] is None:
-        raise HTTPException(409, "this exchange has no AI reply to review")
     if row["sent"]:
         raise HTTPException(409, "already sent")
+    manual = _is_manual(row)
+    if not manual and (not row["grounded"] or row["reply"] is None):
+        raise HTTPException(409, "this exchange has no AI reply to review")
 
     reply = req.reply.strip()
     if not reply:
         raise HTTPException(422, "reply cannot be empty")
 
-    # Decoded here, right before use, rather than kept on `req` any longer
-    # than necessary -- the bytes exist only for the one Graph call below and
-    # are never written anywhere; only attachment.name reaches mark_sent.
+    # One optional file, passed straight through to n8n's Outlook Draft node
+    # with the reply and never written here -- only its name is recorded.
     attachment = None
     if req.attachment_name:
         try:
-            content_bytes = base64.b64decode(req.attachment_content_b64 or "", validate=True)
+            size = len(base64.b64decode(req.attachment_content_b64 or "", validate=True))
         except (binascii.Error, ValueError) as exc:
             raise HTTPException(422, f"attachment is not valid base64: {exc}") from exc
-        try:
-            attachment = mail_graph.Attachment(
-                name=req.attachment_name,
-                content_type=req.attachment_content_type or "",
-                content_bytes=content_bytes,
+        if size > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(
+                413, f"attachment is {size} bytes, over the {MAX_ATTACHMENT_BYTES} byte limit"
             )
-        except mail_graph.AttachmentTooLarge as exc:
-            raise HTTPException(413, str(exc)) from exc
+        attachment = {
+            "name": req.attachment_name,
+            "content_type": req.attachment_content_type or "application/octet-stream",
+            "content_b64": req.attachment_content_b64,
+        }
 
+    # Resume the n8n execution paused at "Wait for review", handing it the
+    # reviewer's final wording. Two nodes run on it: Record final draft calls
+    # /review/{id}/drafted to record the text and mark this row, then Outlook
+    # Draft turns it into a reply draft in the mailbox. The Wait node answers
+    # only when they have finished. Recording does not depend on the draft:
+    # if the row was recorded but the workflow reported an error, the reply
+    # is kept as recorded and the draft failure goes back as a warning.
+    draft_error = ""
     if not REVIEW_DRY_RUN:
+        resume_url = row["resume_url"]
+        if not resume_url:
+            raise HTTPException(409, "no n8n execution is waiting on this exchange")
         try:
-            mail_graph.send_reply(row["ref"], reply, attachment=attachment)
-        except mail_graph.GraphNotConfigured as exc:
-            raise HTTPException(503, str(exc)) from exc
-        except mail_graph.GraphSendError as exc:
-            raise HTTPException(502, str(exc)) from exc
-
-    thread_store.mark_sent(
-        exchange_id, reply, attachment_name=req.attachment_name or None
-    )
-
-    # Resume the n8n execution that's been paused (Wait node, webhook resume)
-    # since Record reply, if this exchange came from that workflow. Best
-    # effort only -- the mail is already sent by this point, which is what
-    # actually matters; a stale/expired/unreachable resume URL (n8n
-    # restarted, the 14-day cap already fired, ...) must never turn a
-    # successful send into a failed response.
-    resume_url = row["resume_url"]
-    if resume_url:
-        try:
-            requests.post(resume_url, timeout=10)
+            resp = requests.post(
+                resume_url,
+                json={
+                    "exchange_id": exchange_id,
+                    "reply": reply,
+                    "ref": row["ref"],
+                    "subject": row["reply_subject"],
+                    "attachment": attachment,
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
         except requests.RequestException as exc:
-            print(f"review_send: resume call to n8n failed for {exchange_id}: {exc}")
+            draft_error = str(exc)
+        if not (thread_store.get_exchange(exchange_id) or {}).get("sent"):
+            raise HTTPException(
+                502, f"n8n did not record the reply: {draft_error or 'no error reported'}"
+            )
+    else:
+        _record_final(row, reply, req.attachment_name or None)
+
+    # A reply a person had to write by hand is knowledge the documents lacked.
+    knowledge = _learn_from_manual(row, reply) if manual else None
 
     return {
         "ok": True,
         "id": exchange_id,
-        "sent_via_graph": not REVIEW_DRY_RUN,
+        "drafted_in_outlook": not REVIEW_DRY_RUN and not draft_error,
+        "draft_error": draft_error,
+        "knowledge": knowledge,
         "dry_run": REVIEW_DRY_RUN,
     }
+
+
+class DraftedRequest(BaseModel):
+    """`/review/{id}/drafted` -- the reply as it went into the Outlook draft."""
+
+    reply: str
+    attachment_name: str | None = None
+
+
+@app.post("/review/{exchange_id}/drafted")
+def review_drafted(exchange_id: int, req: DraftedRequest) -> dict:
+    """The workflow's Record final draft node: the reviewer's final text.
+
+    This is what marks a row sent. It runs alongside Outlook Draft and does
+    not depend on it. Idempotent -- mark_sent ignores a row that is
+    already marked.
+    """
+    row = thread_store.get_exchange(exchange_id)
+    if row is None:
+        raise HTTPException(404, "no such exchange")
+    reply = req.reply.strip()
+    if not reply:
+        raise HTTPException(422, "reply cannot be empty")
+    if not row["sent"]:
+        _record_final(row, reply, req.attachment_name or None)
+    return {"ok": True, "id": exchange_id}
 
 
 # --- Knowledge base -----------------------------------------------------
@@ -961,6 +1119,30 @@ def knowledge_list(q: str = "", source: str = "") -> dict:
 def knowledge_add(req: KnowledgeAddRequest) -> dict:
     """Append to the current data/docs/Additions_N.docx and ingest it."""
     return _knowledge_call(rag_additions.add, req.content, req.title)
+
+
+# Declared before the `{chunk_id:path}` route below, which would otherwise
+# swallow "export" as a chunk id.
+@app.get("/knowledge/export")
+def knowledge_export() -> Response:
+    """Everything in the knowledge base as one downloadable JSON file -- the
+    "Export JSON" button on the Knowledge tab. Read-only, same data as GET
+    /knowledge, with a Content-Disposition header so a browser saves it."""
+    chunks = rag_knowledge.list_chunks()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    payload = {
+        "collection": RAG_COLLECTION,
+        "exported_at": now.isoformat(timespec="seconds"),
+        "count": len(chunks),
+        "chunks": chunks,
+    }
+    return Response(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="knowledge-export-{now:%Y-%m-%d}.json"'
+        },
+    )
 
 
 @app.get("/knowledge/{chunk_id:path}")

@@ -351,7 +351,77 @@ def drop_source_caveats(text: str) -> str:
     return out
 
 
-def ground(text: str) -> str:
+# Words that appear in nearly every enquiry and every caveat here, so sharing
+# one says nothing about whether the caveat is about what was asked.
+_GENERIC_WORDS = frozenset(
+    """academy acp evh level levels training trainings course courses programme
+    programmes program module modules session sessions documentation document
+    documents extract extracts context information mention mentions mentioned
+    specify specifies specified provide provides provided include includes
+    included cover covers covered state states stated does that this there
+    whether which what when where with from have will would could about your
+    their they them also only into such than then any some more most""".split()
+)
+
+
+def _content_words(text: str) -> set[str]:
+    words = set(re.findall(r"[a-zà-ÿ0-9]{4,}", text.lower())) - _GENERIC_WORDS
+    return {w[:-1] if w.endswith("s") else w for w in words} - _GENERIC_WORDS
+
+
+def _admitted_gaps(text: str) -> list[str]:
+    """The fragments of `text` in which the model reports the documents as
+    silent: a leading refusal sentence, a whole caveat sentence or bullet, or
+    the ", but <caveat>" tail of a sentence. Exactly the fragments that
+    `_strip_leading_refusal` and `drop_source_caveats` remove."""
+    gaps = []
+    stripped = _strip_leading_refusal(text)
+    if stripped != text:
+        gaps.append(text[: len(text) - len(stripped)])
+    for line in stripped.split("\n"):
+        body = re.sub(r"^\s*[-*•]\s+", "", line).strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", body):
+            contrast = _CONTRAST_SPLIT.search(sentence)
+            if contrast and _is_source_caveat(sentence[contrast.end():]):
+                gaps.append(sentence[contrast.end():])
+            elif _is_source_caveat(sentence):
+                gaps.append(sentence)
+    return gaps
+
+
+def gap_concerns_question(text: str, question: str) -> bool:
+    """True when the model admitted the documents are silent on something the
+    enquirer actually asked.
+
+    The salvage in `ground()` keeps the facts and drops the admission. That is
+    right when the admission is about a side detail nobody asked for, and wrong
+    when it is about the question itself: asked "do you offer a sign language
+    interpreter?", a draft of "The live sessions are interactive, but the
+    documentation does not mention a sign language interpreter" salvages to
+    "The live sessions are interactive." -- a confident reply that answers
+    nothing. Sharing a non-generic word with the question is the test for
+    "about what was asked".
+    """
+    asked = _content_words(question)
+    return bool(asked) and any(asked & _content_words(gap) for gap in _admitted_gaps(text))
+
+
+# The drafting prompt ends with a "Format: reply ..." instruction line. A small
+# model sometimes copies it into the answer, usually dressed as a bullet with
+# bold ("- **Format:** reply in plain prose, ..."). It is an instruction, never
+# content, so the whole line goes. Anchored on the directive's own opening
+# words so a real sentence about, say, an exam format is left alone.
+_FORMAT_ECHO = re.compile(
+    r"(?im)^[ \t]*(?:[-*\u2022][ \t]*)?\**[ \t]*Format[ \t]*:?[ \t]*\**[ \t]*:?[ \t]*"
+    r"(?:reply\b|the enquirer asked\b).*$\n?"
+)
+
+
+def strip_format_echo(text: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", _FORMAT_ECHO.sub("", text)).strip()
+
+
+def ground(text: str, question: str = "") -> str:
     """Clean a model's answer and decide what, if anything, is grounded.
 
     Returns the text to use as the reply, or "" when nothing here is grounded.
@@ -375,8 +445,14 @@ def ground(text: str) -> str:
     anyway even though real, on-topic content follows. `_strip_leading_refusal`
     drops that opening sentence (or sentences) and keeps the rest, the same
     salvage judgment as the trailing case, just at the other end of the reply.
+
+    `question` is the enquiry being answered. When given, none of that salvage
+    applies to a reply that admits the documents are silent on something the
+    enquirer asked (`gap_concerns_question`): that one is ungrounded and goes
+    to a human, since what would be left is an answer to a different question.
+    Without `question` the behaviour is the salvage described above.
     """
-    text = text.strip()
+    text = strip_format_echo(text)
     if not text or text == NO_ANSWER:
         return ""
     if text.endswith(NO_ANSWER):
@@ -384,6 +460,8 @@ def ground(text: str) -> str:
         if not text:
             return ""
     if NO_ANSWER in text:
+        return ""
+    if question and gap_concerns_question(text, question):
         return ""
     text = strip_source_attribution(_strip_leading_refusal(text))
     # Sixth shape: caveats about what the documents do not say, wherever they
@@ -833,7 +911,7 @@ def answer(
     # The refusal may arrive bare, wrapped in a sentence, dressed up as an
     # answer that reports the documents as silent, or trailing after a partial
     # answer -- see `ground`.
-    text = ground(text)
+    text = ground(text, question=f"{question} {query or ''}")
     if not text:
         return Answer(text="", chunks=kept, grounded=False)
 

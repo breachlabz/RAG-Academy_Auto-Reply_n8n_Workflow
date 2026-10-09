@@ -95,17 +95,9 @@ services:
       # literal \n in the value becomes a line break.
       - RAG_EMAIL_GREETING=${RAG_EMAIL_GREETING:-Hello,}
       - RAG_EMAIL_SIGNOFF=${RAG_EMAIL_SIGNOFF:-Best regards,\nThe Training Team}
-      # --- review queue send (Graph, app-only) -- see .env.example ---------
-      # Unset by default: the review queue at /review still works without
-      # these, Send just returns a clear "not configured" error instead of
-      # sending. Fill in .env once the Azure app registration exists.
-      - GRAPH_TENANT_ID=${GRAPH_TENANT_ID:-}
-      - GRAPH_CLIENT_ID=${GRAPH_CLIENT_ID:-}
-      - GRAPH_CLIENT_SECRET=${GRAPH_CLIENT_SECRET:-}
-      - GRAPH_MAILBOX=${GRAPH_MAILBOX:-}
       # UI-testing only: set to 1 in .env to make /review/{id}/send skip the
-      # real Graph call (still writes the DB row as sent). Unset/0 for real
-      # use -- see api.py's REVIEW_DRY_RUN.
+      # hand-off to n8n (still writes the DB row as sent, no Outlook draft is
+      # created). Unset/0 for real use -- see api.py's REVIEW_DRY_RUN.
       - REVIEW_DRY_RUN=${REVIEW_DRY_RUN:-}
       # --- everything below is in-compose wiring, do not touch ------------
       # This stack's own Chroma (local_chromadb above), which n8n's
@@ -164,7 +156,7 @@ services:
       # WEBHOOK_URL is different: it's what n8n bakes into generated webhook
       # URLs, e.g. $execution.resumeUrl for the Academy Agent workflow's
       # "Wait for review" node -- and that one gets POSTed to by the
-      # classifier container (mail/graph.py's review_send()), not by a
+      # classifier container (api.py's review_send()), not by a
       # browser. "localhost" there resolves to the classifier container
       # itself, not n8n, so it must be the docker-network service name.
       - WEBHOOK_URL=http://n8n:5678/

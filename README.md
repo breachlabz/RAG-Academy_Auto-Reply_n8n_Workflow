@@ -8,7 +8,8 @@ Watches an Outlook mailbox and, for each incoming email:
 2. For confident academic-only email, **retrieves** passages from the training
    documents in `data/docs/` and **drafts a reply grounded only in them**.
 3. Queues the draft on the **review page** (`/review`). A person reads, edits
-   and sends it. **Nothing is sent automatically.**
+   and clicks Send; that leaves the final text as a **reply draft in the
+   Outlook mailbox**, where a person sends it. **Nothing is sent automatically.**
 
 Non-academic email, anything the classifier is unsure about, and anything the
 documents don't answer get no draft and are left for a person.
@@ -51,8 +52,8 @@ system.
                     └──────────────┼─────┼────────────────────────────────────────────────────────┘
                                    │     │
                                    ▼     ▼
-                   Microsoft Graph        chat model server (OpenAI-compatible,
-                   (app-only Mail.Send)   llama.cpp / LiteLLM / Ollama — §4)
+                   n8n (resume the Wait   chat model server (OpenAI-compatible,
+                   node → Outlook Draft)  llama.cpp / LiteLLM / Ollama — §4)
 ```
 
 | Container | Image / build | Published | State |
@@ -67,10 +68,10 @@ Nothing is published beyond loopback. The chat model runs outside the stack.
 ### Pipeline
 
 ```
-New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Agent ─▶ Finalize ─▶ Grounded answer? ─true─▶ Record reply ─▶ Wait for review
- (polls every min)   POST          ($json.proceed)          (academy_docs  POST        ($json.grounded)      POST
-                     /emails/prepare                         Chroma tool)  /emails/finalize                  /threads/reply
-                                   └─false─▶ Do nothing                                └─false─▶ Human queue
+New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Agent ─▶ Finalize ─▶ Grounded answer? ─true─▶ Queue for review (UI) ─▶ Wait for review ─┬─▶ Record final draft
+ (polls every min)   POST          ($json.proceed)          (academy_docs  POST        ($json.grounded)      POST /threads/reply                          └─▶ Outlook Draft
+                     /emails/prepare                         Chroma tool)  /emails/finalize
+                                   └─false─▶ Do nothing                                └─false─▶ Human queue ─▶ Queue for manual reply (UI) ─▶ Wait for review (same node)
 ```
 
 | Node | Responsibility |
@@ -78,13 +79,18 @@ New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Age
 | **Prepare** → `/emails/prepare` | Strips HTML and quoted history, records the inbound message (deduplicated on `internetMessageId`), loads the thread, runs the **classifier gate**, rewrites a follow-up into a standalone query. Returns `proceed`, the agent prompt fields and `ref` (Graph message id). |
 | **Is label "Academy"?** | Branches on `proceed`. False → *Do nothing* (non-academic, low confidence, duplicate). |
 | **AI Agent** | Searches `academy_docs` and drafts the body, or returns `NOT_IN_DOCUMENTS`. |
-| **Finalize** → `/emails/finalize` | Grounding net (rejects `NOT_IN_DOCUMENTS` and prose that only reports the documents as silent), wraps the body in greeting/sign-off. |
-| **Record reply** → `/threads/reply` | Stores the draft on the thread and queues it at `/review`. |
-| **Wait for review** | Paused until `/review/{id}/send` resumes it. |
+| **Finalize** → `/emails/finalize` | Grounding net (rejects `NOT_IN_DOCUMENTS` and prose that only reports the documents as silent), wraps the body in greeting/sign-off. Also rejects a draft that admits the documents are silent on what was asked, and any draft the agent wrote without searching the documents (`searched: false`). |
+| **Queue for review (UI)** → `/threads/reply` | Stores the draft on the thread and queues it at `/review`. |
+| **Queue for manual reply (UI)** → `POST /review/manual` | On the Human queue branch: the documents had no grounded answer. Puts the enquiry on the review page's **Manual replies** tab with no AI reply, then joins the same Wait node. A person writes the reply and clicks Send; it is recorded and drafted exactly like a reviewed reply, and the API also adds it to the knowledge base. |
+| **Wait for review** | Wait node set to *On Webhook Call* (POST): the execution stays in n8n's *Waiting* state until `/review/{id}/send` POSTs the reviewer's final text, `{exchange_id, reply, ref, subject}`, to the `resume_url` that Queue for review (UI) stored. Capped at 14 days; after that the reply can no longer be drafted from `/review`. |
+| **Outlook Draft** | `POST /me/messages/{ref}/createReply` with `{comment: reply}` through the Outlook credential: a reply draft in the mailbox, threaded on the original with the original quoted, plus the file the reviewer attached on `/review`, if any (< 3 MB). It cannot send. |
+| **Record final draft** → `/review/{id}/drafted` | Stores the reviewer's final wording and marks the row sent. Independent of Outlook Draft: it sits above it on the canvas, so n8n runs it first and the reply is recorded whether or not the draft could be created. |
 
 The safety logic (gate, grounding, email shell) lives in the API only; the
-workflow is plumbing. Sending happens from the API straight to Graph when a
-reviewer clicks Send.
+workflow is plumbing. The API has no mailbox access: Send hands the final text
+to n8n, n8n leaves it as a draft, and a person sends it from Outlook. On
+`/review`, *sent* therefore means approved on the review page and recorded; the
+draft is attempted alongside, and a failure is shown to the reviewer as a warning.
 
 ---
 
@@ -100,7 +106,7 @@ reviewer clicks Send.
 | Chat model | OpenAI-compatible endpoint with **token logprobs**, **JSON-schema decoding**, **no reasoning output**, context ≥ 8192 — §4 |
 | Network egress | `ghcr.io`, `docker.io`, `huggingface.co`, `login.microsoftonline.com`, `graph.microsoft.com` |
 | Network ingress | SSH only. All service ports are loopback-bound. |
-| Microsoft 365 | Rights to create two app registrations, and a tenant admin for consent — §6 |
+| Microsoft 365 | Rights to create one app registration, and a tenant admin for consent — §6 |
 | Repository access | Read access to this repo |
 
 ---
@@ -238,13 +244,6 @@ Required:
 | `LLM_KEY` | API key, blank for llama.cpp/Ollama |
 | `CHAT_MODEL` | Model name the endpoint exposes (llama.cpp `--alias`) |
 
-Set after §6 (sending):
-
-| Variable | Value |
-|---|---|
-| `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` | App-only send registration (§6b) |
-| `GRAPH_MAILBOX` | UPN of the mailbox replies are sent from |
-
 Optional:
 
 | Variable | Default | Effect |
@@ -255,7 +254,7 @@ Optional:
 | `EC_NUM_CTX` | unset | Ollama `num_ctx` per request |
 | `RAG_EMAIL_GREETING` / `RAG_EMAIL_SIGNOFF` | `Hello,` / `Best regards,\nThe Training Team` | Reply shell; `\n` = line break |
 | `CHAT_MODEL_LARGE` | `CHAT_MODEL` | Larger model for evaluation runs only |
-| `REVIEW_DRY_RUN` | unset | **Testing only.** Send marks rows sent without calling Graph. Must be unset in production. |
+| `REVIEW_DRY_RUN` | unset | **Testing only.** Send marks rows sent without calling n8n, so no Outlook draft is created. Must be unset in production. |
 
 ### 5b. Start and load documents
 
@@ -284,10 +283,10 @@ c "I was charged twice for my course, please refund me."    # non_academic / hum
 
 ## 6. Microsoft 365 app registrations
 
-Two separate registrations, least privilege each. Record client IDs, secret
-values and **secret expiry dates**.
+One delegated registration, used only by n8n. Record the client ID, secret
+value and **secret expiry date**.
 
-### 6a. Inbox read (delegated, used by n8n)
+### 6a. Mailbox access (delegated, used by n8n)
 
 Entra ID → App registrations → New registration:
 
@@ -296,31 +295,9 @@ Entra ID → App registrations → New registration:
   — Entra accepts plain HTTP only for `localhost`, which is why n8n is reached
   through an SSH tunnel at exactly `http://localhost:5678`.
 - Certificates & secrets → new client secret.
-- API permissions → Microsoft Graph → **Delegated**: `Mail.Read`,
-  `offline_access` → Grant admin consent.
-
-### 6b. Send (application, used by `/review` Send)
-
-- New registration `academy-email-send`, single tenant, no redirect URI.
-- API permissions → Microsoft Graph → **Application**: `Mail.Send` → Grant
-  admin consent.
-- Certificates & secrets → new client secret.
-- Put tenant ID, client ID, secret value and mailbox UPN in `.env` (§5a),
-  then `docker compose up -d`.
-
-**Scope it to the one mailbox.** An application `Mail.Send` grant can send as
-any mailbox in the tenant until restricted. Restrict it in Exchange Online
-(application access policy, or RBAC for Applications where your tenant uses
-it), e.g.:
-
-```powershell
-Connect-ExchangeOnline
-New-ApplicationAccessPolicy -AppId <send-app-client-id> `
-  -PolicyScopeGroupId <mail-enabled-security-group-containing-the-mailbox> `
-  -AccessRight RestrictAccess -Description "Academy auto-reply send scope"
-Test-ApplicationAccessPolicy -Identity <mailbox-upn> -AppId <send-app-client-id>   # Granted
-Test-ApplicationAccessPolicy -Identity <any-other-upn> -AppId <send-app-client-id> # Denied
-```
+- API permissions → Microsoft Graph → **Delegated**: `Mail.ReadWrite`,
+  `offline_access` → Grant admin consent. `Mail.ReadWrite` is what lets the
+  workflow create the reply draft; `Mail.Send` is not needed.
 
 ---
 
@@ -341,7 +318,7 @@ it). Review UI: `http://localhost:8100/review`.
 
 | Name | Type | Settings |
 |---|---|---|
-| Outlook (read) | Microsoft Outlook OAuth2 API | §6a client ID/secret → **Connect my account** as the mailbox → *Account connected* |
+| Outlook | Microsoft Outlook OAuth2 API | §6a client ID/secret → **Connect my account** as the mailbox → *Account connected* |
 | Chat model | OpenAI API | Base URL = `LLM_URL`, API key = `LLM_KEY` or any non-empty string |
 | Embedder | OpenAI API | Base URL `http://embedder:80/v1`, API key any non-empty string |
 | Chroma | Chroma API (self-hosted) | Base URL `http://email-classifier-chroma:8000`, no auth |
@@ -353,7 +330,7 @@ agent.
 ### 7c. Import
 
 1. Workflows → Import from File → `n8n/academy-agent-workflow.json`.
-2. Bind credentials: **New Outlook email** → Outlook; **Local Model** → Chat
+2. Bind credentials: **New Outlook email** and **Outlook Draft** → Outlook; **Local Model** → Chat
    model; **Embeddings bge-m3** → Embedder; **academy_docs** → Chroma.
 3. **Local Model**: model = `CHAT_MODEL`. **academy_docs**: collection `docs`.
    **New Outlook email**: folder and poll interval (default Inbox, 1 min).
@@ -372,7 +349,8 @@ optional manual test form (no credentials).
 2. Activate the workflow.
 3. From an external account, email the mailbox: *"What are the training
    levels and who is Level 2 aimed at?"* → row at `/review` within ~2 min →
-   **Send** → reply arrives with the original quoted.
+   **Send** → a reply draft appears in the mailbox with the original quoted →
+   send it from Outlook.
 4. Email *"My invoice still shows unpaid, can you check?"* → no row; execution
    ends at *Do nothing*, `reason: not routed to rag`.
 5. Confirm `REVIEW_DRY_RUN` is unset:
@@ -389,10 +367,19 @@ All commands from `/opt/email-classifier`.
 ### 9a. Daily use
 
 - Reviewers open `/review` through the SSH tunnel (§7a), approve or edit
-  drafts, click **Send**. A failed Send leaves the row queued with the Graph
-  error shown; nothing is recorded as sent unless Graph accepted it.
-- Only non-reviewable mail (non-academic, low confidence, undocumented) stays
-  in the Outlook inbox for manual handling.
+  drafts, click **Send**. That creates the reply draft in Outlook; someone
+  with access to the mailbox sends it from there. One file (< 3 MB) can be attached on the review page;
+  more can be added in Outlook. If
+  n8n does not accept the reply, the row stays queued with the error shown.
+- **Manual replies** tab: academic enquiries the documents could not answer.
+  There is no AI reply; the edit box starts with the greeting and sign-off,
+  the reviewer writes the answer and clicks **Send**. It is recorded and
+  drafted like any other reply, and its body is added to the knowledge base
+  (`Additions_N.docx`, titled with the one-line summary of the question) so
+  the next enquiry on that point can be answered automatically. Write it as a
+  general answer: anything specific to one person would be reused for others.
+- Non-academic and low-confidence mail never reaches the review page and
+  stays in the Outlook inbox for manual handling.
 
 ### 9b. Training documents
 
@@ -422,7 +409,7 @@ and `metadata` (JSON: `source`, `heading`, `chunk_index`).
   show up in the list and survive `ingest --reset` like every other document.
   If the embedder or Chroma rejects the write, the file is restored and
   nothing is added (`rag/additions.py`).
-- **API:** `GET/POST /knowledge`, `GET /knowledge/{id}` (§11).
+- **API:** `GET/POST /knowledge`, `GET /knowledge/export`, `GET /knowledge/{id}` (§11).
 - **Bulk (host CLI only):**
   ```sh
   docker compose exec -T classifier python -m rag knowledge export > chunks.json
@@ -449,7 +436,7 @@ Rules:
 ### 9d. Configuration changes
 
 Edit `.env`, then `docker compose up -d` (recreates only changed services).
-Reply wording, thresholds and Graph credentials are all `.env`.
+Reply wording and thresholds are all `.env`.
 
 ### 9e. Backups
 
@@ -516,7 +503,7 @@ classification and the Knowledge tab, when upgrading an existing deployment:
 | Mail flowing | n8n → Executions: successful runs every poll; failures on *Prepare* indicate model/API problems |
 | Review backlog | `curl -s http://127.0.0.1:8100/review/queue \| jq '[.pending[].exchanges[]] \| length'` |
 | Logs | `docker compose logs --since 1h classifier` (also `n8n`, `embedder`, `local_chromadb`) |
-| Secret expiry | both Entra client secrets (§6) — rotate before expiry: update the n8n Outlook credential and `GRAPH_CLIENT_SECRET` + `docker compose up -d` |
+| Secret expiry | the Entra client secret (§6) — rotate before expiry and update the n8n Outlook credential |
 
 ### 9h. Lifecycle
 
@@ -544,9 +531,10 @@ All services use `restart: unless-stopped` and come back after a host reboot.
 | Knowledge save returns 502 | Embedder or Chroma unreachable | Row unchanged; fix the service and retry |
 | n8n Outlook *Connect* fails | Redirect mismatch | Browser must be at exactly `http://localhost:5678`; redirect URI must match §6a |
 | n8n agent answers from stale content | n8n Chroma credential points elsewhere | Must be `http://email-classifier-chroma:8000` (§7b) |
-| Send → 503 *not configured* | `GRAPH_*` missing | §6b, then `docker compose up -d` |
-| Send → 502 | Graph rejected | Row stays queued; check admin consent, `GRAPH_MAILBOX`, access policy scope |
-| Rows marked sent but no mail delivered | `REVIEW_DRY_RUN` set | Unset it, `docker compose up -d` |
+| Send → 409 *no n8n execution is waiting* | Row did not come from the workflow (follow-up, `/generate-reply`) | Answer by hand |
+| Send → 502 | n8n unreachable, or the waiting execution expired (14 days) or was already resumed | Check n8n → Executions; answer by hand if it is gone |
+| Send → *Recorded, but the Outlook draft was NOT created* | *Outlook Draft* failed: credential missing/wrong type, no `Mail.ReadWrite`, or the original message was moved | The reply is recorded and leaves the queue; n8n → Executions shows the error. Answer that email by hand |
+| Rows marked sent but no draft created | `REVIEW_DRY_RUN` set | Unset it, `docker compose up -d` |
 
 ---
 
@@ -566,10 +554,14 @@ on the host. No authentication — loopback/tunnel access only (§12).
 | `POST /threads/reply` | `{"conversation_id", "reply", "subject", "grounded"}` → records the draft; queues it when grounded |
 | `GET /threads`, `GET /threads/{id}` | conversations / one conversation's turns |
 | `GET /review` | review UI (Reply review + Knowledge tabs) |
+| `GET /review/manual` | enquiries with no grounded answer, awaiting a hand-written reply (same shape as `/review/queue`) |
+| `POST /review/manual` | `{"exchange_id", "resume_url", "subject"?}` → the workflow puts an unanswerable enquiry on that queue |
 | `GET /review/queue`, `GET /review/history` | pending / sent replies grouped by conversation |
-| `POST /review/{id}/send` | `{"reply", "attachment_*"?}` → sends via Graph, records it. 503 not configured, 502 Graph rejected (row stays queued), 413 attachment > 3 MB |
+| `POST /review/{id}/send` | `{"reply", "attachment_*"?}` → resumes the workflow so n8n creates the Outlook draft, records it. response carries `draft_error` when the reply was recorded but the draft failed, and `knowledge` (`{file, entry}` or `{error}`) for a manual reply; 502 nothing was recorded (row stays queued), 409 nothing waiting, 413 attachment > 3 MB |
+| `POST /review/{id}/drafted` | `{"reply"}` → called by the workflow's last node called by Record final draft with the reviewer's final text; marks the row sent |
 | `GET /knowledge` | all chunks `{id, content, metadata, origin, edited, created_at, updated_at}` + `sources` |
 | `POST /knowledge` | `{"content", "title"?}` → appended to `data/docs/Additions_N.docx` (20 per file) and ingested; returns `{file, entry, max, chunks}`. 422 empty content / 502 embedder or Chroma failure |
+| `GET /knowledge/export` | every chunk as a downloadable JSON file `{collection, exported_at, count, chunks}` — the **Export JSON** button on the Knowledge tab |
 | `GET /knowledge/{id}` | one chunk. URL-encode ids (`#` → `%23`). 404 unknown. No `PUT`/`DELETE` — existing content is read-only |
 
 - `type` is `academic` only when academic and nothing else; otherwise
@@ -581,24 +573,24 @@ on the host. No authentication — loopback/tunnel access only (§12).
 
 ## 12. Security model and guarantees
 
-- **No automatic sending.** Only `POST /review/{id}/send` reaches
-  `mail/graph.py`; nothing in the classify/retrieve/draft path has Graph
-  access. A failed Send is never recorded as sent.
+- **No automatic sending.** The API has no mailbox access. The workflow's
+  only write to the mailbox is `createReply`, which makes a draft and cannot
+  send; a person sends from Outlook.
 - **No network exposure.** Every service binds to `127.0.0.1` (model server to
   the Docker bridge). The review UI, Knowledge editor and API have **no
   authentication** — access is via SSH tunnel only. Exposing them requires an
   authenticating reverse proxy (SSO) in front; knowledge edits change live
   replies.
 - **n8n executes arbitrary code** — never publish port 5678.
-- **Least privilege in Graph:** read is delegated `Mail.Read`; send is
-  application `Mail.Send` scoped to one mailbox (§6b).
+- **Least privilege in Graph:** one delegated credential with
+  `Mail.ReadWrite`. No application permission, no `Mail.Send`.
 - **Secrets** live in `.env` (mode 600) and the n8n volume. Neither is in git.
-  Rotate both Entra secrets before expiry.
+  Rotate the Entra secret before expiry.
 - **Non-academic mail never gets a draft**, and every factual sentence in a
   draft comes from `data/docs/` or the knowledge table; unsupported questions
   go to a person.
-- **Attachments** added at Send are passed straight to Graph (≤ 3 MB) and
-  never stored; only the file name is recorded.
+- **Attachments** added on the review page are passed straight through n8n
+  to the draft (≤ 3 MB) and never stored; only the file name is recorded.
 
 ---
 
@@ -683,7 +675,6 @@ threads/store.py            conversations, turns, dedupe, review queue (SQLite)
 threads/context.py          history block, standalone-question rewrite, rolling summary
 threads/gist.py             one-line enquiry summary for the review UI
 mail/text.py                HTML → text, quoted-reply stripping
-mail/graph.py               app-only Graph send (reply, HTML rendering, attachment)
 frontend/                   review UI (Next.js static export → served at /review)
 n8n/academy-agent-workflow.json          mailbox pipeline
 n8n/email-classifier-form-workflow.json  optional manual test form

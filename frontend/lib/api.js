@@ -18,6 +18,16 @@ export async function fetchQueue() {
   return { groups: data.pending || [], dryRun: !!data.dry_run };
 }
 
+// Enquiries the documents could not answer: no AI reply, a person writes
+// one. Same shape as fetchQueue; each exchange carries `manual: true` and a
+// `prefill` (the empty greeting/sign-off shell) for the edit box.
+export async function fetchManual() {
+  const res = await fetch(`${BASE}/manual`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return data.pending || [];
+}
+
 export async function fetchHistory() {
   const res = await fetch(`${BASE}/history`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);

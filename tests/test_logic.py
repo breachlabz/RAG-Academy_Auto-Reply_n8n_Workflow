@@ -119,6 +119,44 @@ class TestGround(unittest.TestCase):
             with self.subTest(raw=raw[:50]):
                 self.assertEqual(ground(raw), expected)
 
+    def test_echoed_format_instruction_is_dropped(self):
+        """The prompt's "Format:" line must never reach the reply."""
+        body = "The certificate is valid for three years."
+        for echo in (
+            "- **Format:** reply in plain prose, at most four sentences, with no list.",
+            "Format: reply as a bulleted list -- one \"- \" item per point.",
+        ):
+            self.assertEqual(rag_core.ground(f"{body}\n\n{echo}"), body)
+        kept = "Format: the exam is multiple choice."
+        self.assertEqual(rag_core.ground(kept), kept)
+
+    def test_gap_about_the_question_is_ungrounded(self):
+        captions_q = ("Does the ACP Level 2 course offer live captions or a "
+                      "sign language interpreter during the live sessions?")
+        ects_q = ("Does the ACP Level 1 training give university ECTS credits? "
+                  "I would like to count it towards my master's degree.")
+        cases = [
+            # real agent drafts: a related fact with the admission welded on
+            ("The ACP Level 2 “Advanced Engineering” live sessions are "
+             "interactive and include plenty of time for questions and "
+             "discussions, but the documentation does not mention any provision "
+             "for live captions or a sign language interpreter.", captions_q, False),
+            ('The ACP Level 1 "Foundation" training provides a CYEQT Certificate '
+             "of Attendance, but the documentation does not mention university "
+             "ECTS credits. You would need to consult your university.", ects_q, False),
+            # leading refusal about what was asked, related content after it
+            ("The documentation does not specify whether ECTS credits are "
+             "awarded. The training ends with a TÜV Rheinland exam.", ects_q, False),
+            # admission about a side detail nobody asked for: fact survives
+            ("The ACP Level 2 live sessions offer no captions. The documentation "
+             "does not mention discounts.", captions_q, True),
+            # a plain answer is untouched
+            ("ACP Level 2 consists of six live sessions.", captions_q, True),
+        ]
+        for raw, question, kept in cases:
+            with self.subTest(raw=raw[:50]):
+                self.assertEqual(bool(ground(raw, question=question)), kept)
+
     def test_source_attribution_stripped(self):
         cases = [
             ('The documentation states that for ACP Level 1 "Foundation" training, '
@@ -237,6 +275,21 @@ class TestThreadStore(unittest.TestCase):
         get = lambda i: thread_store.get_exchange(i, path=self.db)["reply"]  # noqa: E731
         self.assertEqual((get(first), get(stuck), get(third)), ("the 1st", None, "10% off"))
 
+    def test_manual_queue(self):
+        """Unanswerable enquiry: queued with no reply, then answered by hand."""
+        eid = thread_store.record_inbound("c", "what is the dress code?", path=self.db)
+        self.assertEqual(thread_store.pending_manual(path=self.db), [])
+        thread_store.queue_manual(eid, "http://n8n/resume", path=self.db)
+        self.assertEqual([r["id"] for r in thread_store.pending_manual(path=self.db)], [eid])
+        self.assertEqual(thread_store.pending_review(path=self.db), [])
+        self.assertFalse(thread_store.history("c", path=self.db)[0].answered)
+        self.assertTrue(thread_store.record_manual_reply(eid, "Smart casual.", path=self.db))
+        self.assertFalse(thread_store.record_manual_reply(eid, "again", path=self.db))
+        row = thread_store.get_exchange(eid, path=self.db)
+        self.assertEqual((row["reply"], row["edited_reply"], row["sent"], row["grounded"]),
+                         ("Smart casual.", "Smart casual.", 1, 0))
+        self.assertEqual(thread_store.pending_manual(path=self.db), [])
+
     def test_mark_sent(self):
         eid = thread_store.record_inbound("c", "q", path=self.db)
         thread_store.mark_sent(eid, "a", attachment_name="notes.pdf", path=self.db)
@@ -297,6 +350,20 @@ class TestGenerateReply(unittest.TestCase):
                 if flag:
                     self.assertTrue(payload[flag])
                 rag.assert_not_called()
+
+
+class TestFinalizeSearched(unittest.TestCase):
+    def test_reply_without_a_search_is_ungrounded(self):
+        import api
+        draft = "The ACP Level 1 TÜV exam is 90 minutes long and consists of 40 multiple-choice questions."
+        cases = [(False, False), (True, True), (None, True)]
+        for searched, grounded in cases:
+            with self.subTest(searched=searched):
+                out = api.finalize_email(api.FinalizeRequest(output=draft, searched=searched))
+                self.assertEqual(out["grounded"], grounded)
+                self.assertEqual(bool(out["reply"]), grounded)
+        out = api.finalize_email(api.FinalizeRequest(output=draft, searched=False))
+        self.assertIn("without searching", out["reason"])
 
 
 class TestKnowledgeStore(unittest.TestCase):

@@ -25,6 +25,10 @@ export function fetchChunks() {
   return call(BASE);
 }
 
+// The whole knowledge base as a JSON file. The server sets
+// Content-Disposition, so navigating here downloads instead of rendering.
+export const EXPORT_URL = `${BASE}/export`;
+
 // Appends to the current data/docs/Additions_N.docx and ingests it.
 // Returns {file, entry, max, chunks}.
 export function addContent({ title, content }) {

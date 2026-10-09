@@ -21,7 +21,10 @@ function fmtDate(iso) {
 // differs from `reply` (the original AI draft) when a human changed it
 // before clicking Send.
 export default function HistoryRow({ row }) {
-  const wasEdited = (row.edited_reply || "") !== (row.reply || "");
+  // grounded === 0 with a sent reply: nobody drafted it, a person wrote it
+  // on the Manual tab (and it went into the knowledge base).
+  const manual = !row.grounded && !row.is_followup;
+  const wasEdited = !manual && (row.edited_reply || "") !== (row.reply || "");
 
   return (
     <div className="row history-row">
@@ -49,7 +52,7 @@ export default function HistoryRow({ row }) {
       </div>
 
       <div className="col">
-        <ClampedText text={row.reply || ""} />
+        {manual ? <div className="edited-note">No AI reply — written by hand</div> : <ClampedText text={row.reply || ""} />}
       </div>
 
       <div className="col">
