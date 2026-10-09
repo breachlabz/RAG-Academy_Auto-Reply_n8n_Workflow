@@ -5,7 +5,7 @@
 #
 #   cp .env.example .env      # then set LLM_URL, LLM_KEY, CHAT_MODEL
 #   docker compose up -d --build
-#   docker compose exec classifier python -m rag ingest --reset
+#   docker compose exec academy-api python -m rag ingest --reset
 #
 # See README.md for the full first-run checklist -- and its "Chat model
 # requirements" section before pointing this at an Ollama backend.
@@ -56,7 +56,7 @@ services:
     # INCIDENT (2026-09-22): this service used to be named `chromadb:`, which
     # is also the container_name of an unrelated, box-wide Chroma from the
     # `ai-server` stack on the dev box.
-    # RAG_CHROMA_HOST=chromadb on the classifier service resolves through
+    # RAG_CHROMA_HOST=chromadb on the academy-api service resolves through
     # Docker's embedded DNS across BOTH networks it joins -- and it resolved
     # to that OTHER container, silently, the whole time. n8n's academy_docs
     # tool points at that same shared instance on purpose (its credential is
@@ -68,10 +68,10 @@ services:
     # future restart-order change can flip which container "chromadb" means.
     # Do NOT rename this back to `chromadb:`.
     #
-    # Since 2026-09-24 the classifier points at this service
+    # Since 2026-09-24 the academy-api service points at this service
     # (RAG_CHROMA_HOST=local_chromadb), so every host is self-contained.
 
-  classifier:
+  academy-api:
     build: .
     container_name: email-classifier-api
     depends_on:
@@ -134,7 +134,11 @@ services:
       retries: 5
       start_period: 20s
     networks:
-      - emailflow
+      emailflow:
+        # Old service name, kept so emails already waiting for review (their
+        # n8n run still calls http://classifier:8100) can still be sent.
+        aliases:
+          - classifier
     restart: unless-stopped
 
   n8n:
@@ -156,8 +160,8 @@ services:
       # WEBHOOK_URL is different: it's what n8n bakes into generated webhook
       # URLs, e.g. $execution.resumeUrl for the Academy Agent workflow's
       # "Wait for review" node -- and that one gets POSTed to by the
-      # classifier container (api.py's review_send()), not by a
-      # browser. "localhost" there resolves to the classifier container
+      # academy-api container (api.py's review_send()), not by a
+      # browser. "localhost" there resolves to the academy-api container
       # itself, not n8n, so it must be the docker-network service name.
       - WEBHOOK_URL=http://n8n:5678/
     ports:
@@ -166,7 +170,7 @@ services:
       #   ssh -L 5678:127.0.0.1:5678 <this-host>
       # then open http://localhost:5678
       - "127.0.0.1:5678:5678"
-    # Same as the classifier: the AI Agent's chat-model credential reaches a
+    # Same as academy-api: the AI Agent's chat-model credential reaches a
     # model server on this host at http://host.docker.internal:<port>/v1.
     # Linux Docker does not define that name unless it is mapped here.
     extra_hosts:

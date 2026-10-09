@@ -3,7 +3,7 @@ if it regressed, with similar cases table-driven via subTest.
 
 Covers classifier routing, ground() salvage, answer() grounding, list/prose
 formatting, threads.store dedupe + exact-id replies, the /generate-reply
-branches, and the editable knowledge table. Model, Chroma and Graph calls are
+branches, and the editable knowledge table. Model and Chroma calls are
 mocked; only TestNearDuplicate needs the real embedder and skips without it.
 
     .venv/bin/python -m unittest tests.test_logic -v

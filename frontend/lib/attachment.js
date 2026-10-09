@@ -4,7 +4,7 @@
 // call, which itself never writes it to disk or the DB (see api.py's
 // review_send and threads/store.py's attachment_name comment).
 //
-// Mirrors mail/graph.py's MAX_ATTACHMENT_BYTES -- Graph rejects a same-call
+// Mirrors api.py's MAX_ATTACHMENT_BYTES -- Graph rejects a same-call
 // fileAttachment above this size, so it's enforced here too, to fail before
 // the upload rather than after.
 export const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;

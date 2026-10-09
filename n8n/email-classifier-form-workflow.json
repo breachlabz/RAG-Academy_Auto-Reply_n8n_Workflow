@@ -29,7 +29,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://classifier:8100/answer",
+        "url": "http://academy-api:8100/answer",
         "sendBody": true,
         "contentType": "json",
         "bodyParameters": {

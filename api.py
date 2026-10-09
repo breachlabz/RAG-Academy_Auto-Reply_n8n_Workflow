@@ -173,8 +173,8 @@ class PrepareRequest(BaseModel):
     `body` is the message body straight from Graph (HTML unless `is_html` is
     false); the endpoint strips markup and quoted history the same way
     `/generate-reply` does. `ref` is Graph's message id, stored on the
-    exchange row (`thread_store.record_inbound`) so the review queue's Send
-    can later call `/messages/{ref}/reply` -- see mail/graph.py.
+    exchange row (`thread_store.record_inbound`) so the workflow's Outlook
+    Draft node can later call `/messages/{ref}/createReply`.
     `conversation_id` should be Outlook's conversationId -- absent, the thread
     store falls back to a subject-derived key. `message_id` should be the
     internetMessageId: it is what makes a re-fired trigger idempotent.
@@ -762,10 +762,9 @@ def process_followups() -> dict:
 # The human-in-the-loop step that replaces the Outlook-draft-then-manually-
 # send flow. `Queue for review (UI)` (/threads/reply above) already writes a grounded
 # reply onto its exchange row; this is what surfaces those rows to a person,
-# and what actually sends once they approve -- through mail.graph, not
-# through n8n, since the Outlook OAuth2 credential the workflow would have
-# used is not set up. See mail/graph.py for why that is a *separate*
-# app-only credential rather than the same one.
+# and what hands the approved text back to n8n. This API has no mailbox
+# access: Send resumes the waiting execution, and the workflow records the
+# reply and creates the Outlook draft with n8n's own Outlook credential.
 
 
 class SendReplyRequest(BaseModel):

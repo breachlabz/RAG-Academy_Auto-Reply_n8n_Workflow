@@ -11,8 +11,10 @@ Watches an Outlook mailbox and, for each incoming email:
    and clicks Send; that leaves the final text as a **reply draft in the
    Outlook mailbox**, where a person sends it. **Nothing is sent automatically.**
 
-Non-academic email, anything the classifier is unsure about, and anything the
-documents don't answer get no draft and are left for a person.
+An academic email the documents don't answer gets no AI draft: it goes to the
+review page's **Manual replies** tab, where a person writes the reply, and
+that reply is added to the knowledge base for next time. Non-academic email
+and anything the classifier is unsure about stay in the Outlook inbox.
 
 This file is the single reference for deploying, operating and changing the
 system.
@@ -26,7 +28,7 @@ system.
 3. [Host preparation](#3-host-preparation)
 4. [Chat model](#4-chat-model)
 5. [Install and configure](#5-install-and-configure)
-6. [Microsoft 365 app registrations](#6-microsoft-365-app-registrations)
+6. [Microsoft 365 app registration](#6-microsoft-365-app-registration)
 7. [n8n workflow](#7-n8n-workflow)
 8. [Go-live verification](#8-go-live-verification)
 9. [Operations](#9-operations)
@@ -44,42 +46,76 @@ system.
 ```
                     ┌──────────────────────── docker compose (this repo) ────────────────────────┐
                     │                                                                            │
-  Outlook mailbox ──┼──▶ n8n ──▶ classifier API ──┬──▶ local_chromadb  (vector store, :8000)      │
-   (Graph, read)    │            (FastAPI :8100)  └──▶ embedder        (bge-m3, CPU)             │
+  Outlook mailbox ──┼──▶ n8n ──▶ academy-api    ──┬──▶ local_chromadb  (vector store, :8000)      │
+   (via n8n only)   │            (FastAPI :8100)  └──▶ embedder        (bge-m3, CPU)             │
                     │              │     ▲   the n8n AI Agent retrieves from the same Chroma     │
                     │              ▼     │                                                       │
-                    │      /review  (human approves every send)                                  │
+                    │      /review  (a person approves every reply)                              │
+                    │        ├─ Reply review    grounded AI draft  → read, edit, Send            │
+                    │        └─ Manual replies  no grounded answer → write by hand, Send         │
+                    │                           └─▶ also saved to data/docs/Additions_N.docx     │
+                    │                               and indexed in Chroma (knowledge base)       │
                     └──────────────┼─────┼────────────────────────────────────────────────────────┘
                                    │     │
                                    ▼     ▼
-                   n8n (resume the Wait   chat model server (OpenAI-compatible,
-                   node → Outlook Draft)  llama.cpp / LiteLLM / Ollama — §4)
+                   n8n (Send resumes the  chat model server (OpenAI-compatible,
+                   Wait node → Record +   llama.cpp / LiteLLM / Ollama — §4)
+                   Outlook Draft)
 ```
 
 | Container | Image / build | Published | State |
 |---|---|---|---|
-| `email-classifier-api` | `Dockerfile` (FastAPI + static Next.js review UI) | `127.0.0.1:8100` | `./data` bind mount (`threads.db`) |
+| `email-classifier-api` (compose service `academy-api`) | `Dockerfile` (FastAPI + static Next.js review UI) | `127.0.0.1:8100` | `./data` bind mount (`threads.db`) |
 | `email-classifier-chroma` | `chromadb/chroma:1.5.9` | `127.0.0.1:8011` | volume `chroma-data` |
 | `email-classifier-embedder` | `text-embeddings-inference:cpu-1.5` (bge-m3) | — | volume `embed-cache` |
 | `n8n` | `n8nio/n8n` | `127.0.0.1:5678` | volume `n8n_data` |
 
 Nothing is published beyond loopback. The chat model runs outside the stack.
 
+The API's compose service is **`academy-api`**: that is the name used in every
+`docker compose … academy-api` command and in the workflow's URLs
+(`http://academy-api:8100`). The container itself is still named
+`email-classifier-api` (`docker exec`, `docker logs`). The old service name
+`classifier` is kept as a network alias so emails that were already waiting
+for review before the rename can still be sent.
+
 ### Pipeline
 
 ```
-New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Agent ─▶ Finalize ─▶ Grounded answer? ─true─▶ Queue for review (UI) ─▶ Wait for review ─┬─▶ Record final draft
- (polls every min)   POST          ($json.proceed)          (academy_docs  POST        ($json.grounded)      POST /threads/reply                          └─▶ Outlook Draft
-                     /emails/prepare                         Chroma tool)  /emails/finalize
-                                   └─false─▶ Do nothing                                └─false─▶ Human queue ─▶ Queue for manual reply (UI) ─▶ Wait for review (same node)
+New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─false─▶ Do nothing   (non-academic, unsure, duplicate: stays in the inbox)
+ (polls every min)   POST /emails/prepare   │
+                                           true
+                                            ▼
+                                        AI Agent ─▶ Finalize ─▶ Grounded answer?
+                                  (academy_docs     POST /emails/finalize   │
+                                   Chroma tool)                             │
+                      ┌─────────────────────true───────────────────────────┴──────────false──────────────────┐
+                      ▼                                                                                       ▼
+            Queue for review (UI)                                                Human queue ─▶ Queue for manual reply (UI)
+            POST /threads/reply                                                                 POST /review/manual
+            → "Reply review" tab, AI draft                                                      → "Manual replies" tab, empty reply
+                      └──────────────────────────────┬────────────────────────────────────────────────────────┘
+                                                     ▼
+                                              Wait for review        (paused until a person clicks Send on /review)
+                                                     │
+                                  ┌──────────────────┴──────────────────┐
+                                  ▼                                     ▼
+                         Record final draft                       Outlook Draft
+                         POST /review/{id}/drafted                createReply → draft in the mailbox,
+                         (final text saved, row marked sent)      a person sends it from Outlook
+
+A manual reply is, in addition, added to the knowledge base by the API (Additions_N.docx → Chroma),
+so the next enquiry on the same point gets a grounded AI draft on the Reply review tab.
 ```
 
 | Node | Responsibility |
 |---|---|
 | **Prepare** → `/emails/prepare` | Strips HTML and quoted history, records the inbound message (deduplicated on `internetMessageId`), loads the thread, runs the **classifier gate**, rewrites a follow-up into a standalone query. Returns `proceed`, the agent prompt fields and `ref` (Graph message id). |
 | **Is label "Academy"?** | Branches on `proceed`. False → *Do nothing* (non-academic, low confidence, duplicate). |
-| **AI Agent** | Searches `academy_docs` and drafts the body, or returns `NOT_IN_DOCUMENTS`. |
+| **AI Agent** | Searches `academy_docs` and drafts the body, or returns `NOT_IN_DOCUMENTS`. The model decides for itself whether to call the search tool, so the prompt ends with a fixed line — *"Your first step is always a call to academy_docs. Do not write any answer before its results come back."* Without it the model skipped the search on roughly one email in five and answered from its own knowledge (rejected by Finalize). Do not remove that line. |
 | **Finalize** → `/emails/finalize` | Grounding net (rejects `NOT_IN_DOCUMENTS` and prose that only reports the documents as silent), wraps the body in greeting/sign-off. Also rejects a draft that admits the documents are silent on what was asked, and any draft the agent wrote without searching the documents (`searched: false`). |
+| **Grounded answer?** | Branches on `grounded`. True → *Queue for review (UI)*. False → *Human queue*. |
+| **Human queue** | Marks the email as needing a person (no AI reply) and passes it to *Queue for manual reply (UI)*. |
 | **Queue for review (UI)** → `/threads/reply` | Stores the draft on the thread and queues it at `/review`. |
 | **Queue for manual reply (UI)** → `POST /review/manual` | On the Human queue branch: the documents had no grounded answer. Puts the enquiry on the review page's **Manual replies** tab with no AI reply, then joins the same Wait node. A person writes the reply and clicks Send; it is recorded and drafted exactly like a reviewed reply, and the API also adds it to the knowledge base. |
 | **Wait for review** | Wait node set to *On Webhook Call* (POST): the execution stays in n8n's *Waiting* state until `/review/{id}/send` POSTs the reviewer's final text, `{exchange_id, reply, ref, subject}`, to the `resume_url` that Queue for review (UI) stored. Capped at 14 days; after that the reply can no longer be drafted from `/review`. |
@@ -87,10 +123,27 @@ New Outlook email ─▶ Prepare ─▶ Is label "Academy"? ─true─▶ AI Age
 | **Record final draft** → `/review/{id}/drafted` | Stores the reviewer's final wording and marks the row sent. Independent of Outlook Draft: it sits above it on the canvas, so n8n runs it first and the reply is recorded whether or not the draft could be created. |
 
 The safety logic (gate, grounding, email shell) lives in the API only; the
-workflow is plumbing. The API has no mailbox access: Send hands the final text
+workflow is plumbing. The API has no mailbox access and no Microsoft Graph
+code or credentials; the only Graph calls are made by n8n (reading the mailbox
+and the *Outlook Draft* node), with n8n's Outlook credential: Send hands the final text
 to n8n, n8n leaves it as a draft, and a person sends it from Outlook. On
 `/review`, *sent* therefore means approved on the review page and recorded; the
-draft is attempted alongside, and a failure is shown to the reviewer as a warning.
+draft is attempted alongside. If the draft fails, Send still reports
+"Recorded." with no error; the failure is visible only in n8n → Executions
+(§10).
+
+Known limits:
+
+- **Edits made in Outlook are not recorded.** The record holds what was
+  approved on `/review`; changes made to the draft afterwards stay in Outlook.
+- **Bold / italic markers are not converted.** The Bold and Italic buttons
+  on `/review` add `**` / `*` markers; the Outlook draft gets the text exactly
+  as written, so the markers show as typed. Format in Outlook if needed.
+- **The search is asked for, not enforced.** The AI Agent's prompt tells the
+  model to search first, but nothing forces it. If it still skips the search
+  (most likely on a repeated question in the same thread, where the earlier
+  reply is in the history), Finalize rejects the draft and the email goes to
+  Manual replies. It is never sent with an unchecked answer.
 
 ---
 
@@ -264,9 +317,9 @@ docker compose logs -f embedder          # first boot pulls bge-m3 (~2 GB); wait
 docker compose ps                        # 4 containers Up, API (healthy)
 curl -fsS http://127.0.0.1:8100/health   # {"ok":true}
 
-docker compose exec classifier python -m rag check            # extraction stats per document
-docker compose exec classifier python -m rag ingest --reset   # "NN chunks -> collection 'docs'"
-docker compose exec classifier python -m rag ask "what are the training levels?"
+docker compose exec academy-api python -m rag check            # extraction stats per document
+docker compose exec academy-api python -m rag ingest --reset   # "NN chunks -> collection 'docs'"
+docker compose exec academy-api python -m rag ask "what are the training levels?"
 ```
 
 `ingest` also populates the `knowledge_chunks` table (§9c).
@@ -281,7 +334,7 @@ c "I was charged twice for my course, please refund me."    # non_academic / hum
 
 ---
 
-## 6. Microsoft 365 app registrations
+## 6. Microsoft 365 app registration
 
 One delegated registration, used only by n8n. Record the client ID, secret
 value and **secret expiry date**.
@@ -296,8 +349,8 @@ Entra ID → App registrations → New registration:
   through an SSH tunnel at exactly `http://localhost:5678`.
 - Certificates & secrets → new client secret.
 - API permissions → Microsoft Graph → **Delegated**: `Mail.ReadWrite`,
-  `offline_access` → Grant admin consent. `Mail.ReadWrite` is what lets the
-  workflow create the reply draft; `Mail.Send` is not needed.
+  `offline_access` → Grant admin consent. `Mail.ReadWrite` lets the workflow
+  read new mail and create the reply draft.
 
 ---
 
@@ -337,7 +390,13 @@ agent.
 4. Save. Leave inactive until §8.
 
 Re-importing a workflow drops credential bindings and deactivates it; redo
-steps 2–4 after any import. `n8n/email-classifier-form-workflow.json` is an
+steps 2–4 after any import. Close any open n8n editor tab first: saving from a
+stale tab overwrites the import.
+
+**Test: sample email** must keep `{{ $now.toMillis() }}` in `id` and
+`conversationId`. With a fixed `conversationId` every test run joins the same
+thread, and from the second run on the agent copies the earlier reply and is
+rejected (*answered without searching*). `n8n/email-classifier-form-workflow.json` is an
 optional manual test form (no credentials).
 
 ---
@@ -353,10 +412,15 @@ optional manual test form (no credentials).
    send it from Outlook.
 4. Email *"My invoice still shows unpaid, can you check?"* → no row; execution
    ends at *Do nothing*, `reason: not routed to rag`.
-5. Confirm `REVIEW_DRY_RUN` is unset:
+5. Email an academic question the documents do not cover → row on the
+   **Manual replies** tab with an empty reply → write the answer → **Send** →
+   the row moves to History and the answer appears as a new entry in
+   `data/docs/Additions_N.docx`. The same question in a **new** thread then
+   lands on Reply review.
+6. Confirm `REVIEW_DRY_RUN` is unset:
    `docker exec email-classifier-api printenv REVIEW_DRY_RUN` prints nothing
    (the review page also shows a *Dry run* badge when it's set).
-6. Take the first backup (§9e) and record secret expiry dates.
+7. Take the first backup (§9e) and record secret expiry dates.
 
 ---
 
@@ -385,8 +449,8 @@ All commands from `/opt/email-classifier`.
 
 ```sh
 # replace/add files in data/docs/ (.docx .pdf .md .txt .html), then:
-docker compose exec classifier python -m rag check
-docker compose exec classifier python -m rag ingest --reset
+docker compose exec academy-api python -m rag check
+docker compose exec academy-api python -m rag ingest --reset
 ```
 
 `check` flags documents that extract little text (scanned PDFs, text in
@@ -413,14 +477,27 @@ and `metadata` (JSON: `source`, `heading`, `chunk_index`).
 - **API:** `GET/POST /knowledge`, `GET /knowledge/export`, `GET /knowledge/{id}` (§11).
 - **Bulk (host CLI only):**
   ```sh
-  docker compose exec -T classifier python -m rag knowledge export > chunks.json
-  docker compose exec -T classifier python -m rag knowledge import - < chunks.json
+  docker compose exec -T academy-api python -m rag knowledge export > chunks.json
+  docker compose exec -T academy-api python -m rag knowledge import - < chunks.json
   ```
   Import validates the whole file first, updates changed chunks, creates
   entries with no/unknown id as manual chunks, never deletes.
 
 Rules:
 
+- **After editing anything in `data/docs/`, run `ingest` inside the
+  container** — `docker compose exec -T academy-api python -m rag ingest`. It
+  updates Chroma and the table and removes deleted entries. Running
+  `python -m rag …` on the host talks to a different Chroma (`localhost`) and
+  changes nothing the app uses.
+- **Deleting a whole file needs `--reset`.** A plain `ingest` only cleans up
+  files it loads, so the chunks of a file that was deleted from `data/docs/`
+  (for example a removed `Additions_N.docx`) stay in Chroma and the agent
+  keeps answering from them. After deleting a file run
+  `docker compose exec -T academy-api python -m rag ingest --reset`.
+- **`knowledge pull` never deletes.** It only copies Chroma into the table, so
+  it brings back anything still in Chroma. It is for an empty table, not for
+  applying document edits.
 - **Documents win.** `ingest` overwrites the rows of every file it loads
   (edits included) and removes rows for sections no longer present. Durable
   changes belong in the source document.
@@ -432,7 +509,7 @@ Rules:
 - Metadata values must be flat (string, number, boolean); `source` and
   `heading` are required.
 - Table empty on an existing deployment (collection ingested before the table
-  existed): `docker compose exec classifier python -m rag knowledge pull`.
+  existed): `docker compose exec academy-api python -m rag knowledge pull`.
 
 ### 9d. Configuration changes
 
@@ -450,7 +527,7 @@ Reply wording and thresholds are all `.env`.
 
 ```sh
 B=/var/backups/email-classifier/$(date +%F); sudo mkdir -p "$B" && sudo chown "$USER" "$B"
-docker compose exec -T classifier python -c \
+docker compose exec -T academy-api python -c \
   "import sqlite3; sqlite3.connect('/app/data/threads.db').backup(sqlite3.connect('/app/data/threads.backup.db'))" \
   && mv data/threads.backup.db "$B/threads.db"
 docker run --rm -v email-classifier_n8n_data:/v:ro -v "$B":/out alpine tar czf /out/n8n_data.tgz -C /v .
@@ -463,11 +540,11 @@ host. Retention per your policy.
 Restore:
 
 ```sh
-docker compose stop classifier n8n
+docker compose stop academy-api n8n
 cp <backup>/threads.db data/threads.db && rm -f data/threads.db-wal data/threads.db-shm
 docker run --rm -v email-classifier_n8n_data:/v -v <backup>:/in alpine sh -c "find /v -mindepth 1 -delete && tar xzf /in/n8n_data.tgz -C /v"
 docker compose up -d
-docker compose exec classifier python -m rag ingest --reset   # if chroma-data was lost
+docker compose exec academy-api python -m rag ingest --reset   # if chroma-data was lost
 ```
 
 ### 9f. Upgrades and rollback
@@ -488,11 +565,24 @@ against a newer `threads.db`. If a release re-ingested the collection, re-run
 Release-specific steps for the version introducing `academic`/`non_academic`
 classification and the `knowledge_chunks` table, when upgrading an existing deployment:
 
-- `docker compose exec classifier python -m rag knowledge pull`
+- `docker compose exec academy-api python -m rag knowledge pull`
 - `docker compose up -d` also recreates `n8n` (new `host.docker.internal`
   mapping); state is in its volume.
 - Re-import the optional form workflow if used (score fields renamed).
 - `EC_ADMIN_THRESHOLD` was renamed `EC_NON_ACADEMIC_THRESHOLD`.
+
+Release-specific steps for the version that renames the API service from
+`classifier` to `academy-api`:
+
+- `docker compose up -d --build --remove-orphans` (removes the old
+  `classifier` service's container; the new one keeps the container name
+  `email-classifier-api`).
+- A per-host `docker-compose.override.yml` that has a `classifier:` block must
+  rename it to `academy-api:`.
+- Re-import `n8n/academy-agent-workflow.json` (its URLs now use
+  `academy-api`) and bind the credentials again (§7c).
+- Scripts or notes that run `docker compose exec classifier …` must use
+  `academy-api`.
 
 ### 9g. Monitoring
 
@@ -503,13 +593,13 @@ classification and the `knowledge_chunks` table, when upgrading an existing depl
 | Model reachable from the stack | `docker exec email-classifier-api python -c "from classifier.core import BASE_URL,auth_headers;import urllib.request as u;print(u.urlopen(u.Request(BASE_URL+'/models',headers=auth_headers()),timeout=5).status)"` → `200` |
 | Mail flowing | n8n → Executions: successful runs every poll; failures on *Prepare* indicate model/API problems |
 | Review backlog | `curl -s http://127.0.0.1:8100/review/queue \| jq '[.pending[].exchanges[]] \| length'` |
-| Logs | `docker compose logs --since 1h classifier` (also `n8n`, `embedder`, `local_chromadb`) |
+| Logs | `docker compose logs --since 1h academy-api` (also `n8n`, `embedder`, `local_chromadb`) |
 | Secret expiry | the Entra client secret (§6) — rotate before expiry and update the n8n Outlook credential |
 
 ### 9h. Lifecycle
 
 ```sh
-docker compose stop | start | restart classifier
+docker compose stop | start | restart academy-api
 docker compose down          # removes containers, keeps volumes and data/
 docker compose down -v       # DESTROYS n8n credentials/workflows and vectors — never in production
 ```
@@ -527,21 +617,26 @@ All services use `restart: unless-stopped` and come back after a host reboot.
 | Empty or malformed `flags` | Model emits reasoning | §4a `--reasoning-budget 0` / §4b `enable_thinking: false` |
 | Everything goes to *Human queue* on academic mail | Documents don't answer it, or truncated context | `ingest --reset`; confirm topic in `data/docs/`; context ≥ 8192 |
 | *Do nothing*, `already handled (duplicate message_id)` | Same message polled again | Expected |
-| `/health` fails or Chroma errors in API logs | Chroma/embedder not ready | `docker compose logs local_chromadb embedder`; `docker compose restart classifier` |
+| `/health` fails or Chroma errors in API logs | Chroma/embedder not ready | `docker compose logs local_chromadb embedder`; `docker compose restart academy-api` |
 | `embedder` restarting | Model download in progress or disk full | `docker compose logs embedder`; ≥ 3 GB free |
 | `POST /knowledge` returns 502 | Embedder or Chroma unreachable | Row unchanged; fix the service and retry |
 | n8n Outlook *Connect* fails | Redirect mismatch | Browser must be at exactly `http://localhost:5678`; redirect URI must match §6a |
 | n8n agent answers from stale content | n8n Chroma credential points elsewhere | Must be `http://email-classifier-chroma:8000` (§7b) |
 | Send → 409 *no n8n execution is waiting* | Row did not come from the workflow (follow-up, `/generate-reply`) | Answer by hand |
 | Send → 502 | n8n unreachable, or the waiting execution expired (14 days) or was already resumed | Check n8n → Executions; answer by hand if it is gone |
-| Send → *Recorded, but the Outlook draft was NOT created* | *Outlook Draft* failed: credential missing/wrong type, no `Mail.ReadWrite`, or the original message was moved | The reply is recorded and leaves the queue; n8n → Executions shows the error. Answer that email by hand |
+| Send says *Recorded.* but no draft appears in Outlook | *Outlook Draft* failed: credential missing (*Credentials not found*) or wrong type, no `Mail.ReadWrite`, or the original message was moved | The reply is recorded and leaves the queue; n8n → Executions shows the error. Bind the Outlook credential (§7c); answer that email by hand |
+| Send → 502 *n8n did not record the reply* | The waiting execution was already resumed or is gone, so *Record final draft* never ran | Check n8n → Executions; the row stays queued |
+| Academic mail goes to Manual replies, `reason: the agent answered without searching the documents` | The model answered without calling `academy_docs`: the "first step" line is missing from the AI Agent prompt (an old workflow version was imported), or the same question was repeated in one thread | Compare the live AI Agent prompt with `n8n/academy-agent-workflow.json` and re-import if it differs; test with a new `conversationId` (§7c). Changing the model does not fix it |
+| A node fails with *host not found: academy-api* | The workflow was imported on a stack still running the old compose file (service `classifier`) | `git pull`, then `docker compose up -d --build --remove-orphans` |
+| Chunk count does not drop after deleting an entry | `ingest` was not run in the container, then `knowledge pull` copied the old chunks back | §9c: run `ingest` in the container; do not run `knowledge pull` |
+| The agent still answers from a document that was deleted | A whole file was removed from `data/docs/`; plain `ingest` left its chunks in Chroma (the table and Chroma then show different counts) | §9c: `ingest --reset` |
 | Rows marked sent but no draft created | `REVIEW_DRY_RUN` set | Unset it, `docker compose up -d` |
 
 ---
 
 ## 11. HTTP API
 
-`http://classifier:8100` inside the compose network, `http://127.0.0.1:8100`
+`http://academy-api:8100` inside the compose network, `http://127.0.0.1:8100`
 on the host. No authentication — loopback/tunnel access only (§12).
 
 | Endpoint | Purpose |
@@ -651,7 +746,7 @@ python scripts/generate.py --out data           # synthetic set on the large mod
 python scripts/evaluate.py data/holdout.jsonl   # classifier threshold sweep
 python scripts/rag_eval.py                       # grounding: leaks vs misses
 python scripts/thread_eval.py                    # follow-up resolution
-docker cp tests email-classifier-api:/app/ && docker compose exec classifier python -m unittest tests.test_logic   # tests are not baked into the image
+docker cp tests email-classifier-api:/app/ && docker compose exec academy-api python -m unittest tests.test_logic   # tests are not baked into the image
 ```
 
 Generation uses a different model than classification to avoid correlated
@@ -668,7 +763,7 @@ api.py                      HTTP API (classify, answer, prepare/finalize, thread
 classifier/core.py          classify() + route(): prompt, JSON schema, thresholds
 rag/core.py                 ingest(), retrieve(), answer(), embed(), chunking, grounding
 rag/knowledge.py            knowledge_chunks table, synced to Chroma on every write
-rag/additions.py            UI additions -> data/docs/Additions_N.docx (20 per file), ingested
+rag/additions.py            manual replies / POST /knowledge -> data/docs/Additions_N.docx (20 per file), ingested
 rag/docx_text.py            .docx → markdown, extraction checks
 rag/format_hint.py          list-vs-prose decision
 rag/__main__.py             CLI: python -m rag {ingest|ask|check|manifest|knowledge}
@@ -676,7 +771,7 @@ threads/store.py            conversations, turns, dedupe, review queue (SQLite)
 threads/context.py          history block, standalone-question rewrite, rolling summary
 threads/gist.py             one-line enquiry summary for the review UI
 mail/text.py                HTML → text, quoted-reply stripping
-frontend/                   review UI (Next.js static export → served at /review)
+frontend/                   review UI: Reply review + Manual replies tabs (Next.js static export → served at /review)
 n8n/academy-agent-workflow.json          mailbox pipeline
 n8n/email-classifier-form-workflow.json  optional manual test form
 data/docs/                  source documents

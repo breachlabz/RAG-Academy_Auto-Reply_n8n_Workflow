@@ -4,9 +4,8 @@
 // selection should land afterward, so the caller can restore focus.
 //
 // Bold/Italic wrap the selection in markdown-style markers (**/*). The
-// markers are what is stored and sent from here; the backend
-// (mail/graph.py's reply_html) turns them into <strong>/<em> when the reply
-// goes out, so keep the marker syntax in sync with the regexes there.
+// markers are what is stored and sent from here. Nothing converts them to
+// HTML any more: the Outlook draft gets the text exactly as written.
 
 function applyToWholeText(text, transform) {
   const replaced = transform(text);
@@ -63,8 +62,7 @@ export function wrapSelection(text, selectionStart, selectionEnd, marker) {
 // left alone and don't consume a number. If every non-blank line already has
 // this kind of prefix it is removed instead; a line with the *other* kind is
 // converted. The prefixes are plain text on purpose, so a list reads fine
-// even in a plain-text email; mail/graph.py's reply_html renders the same
-// syntax as <ul>/<ol> when the reply goes out as HTML -- keep the two in sync.
+// in the Outlook draft, which gets the text exactly as written.
 const LIST_PREFIX = /^(?:- |\d+\. )/;
 
 export function toggleList(text, selectionStart, selectionEnd, kind) {

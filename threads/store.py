@@ -119,9 +119,9 @@ _ADDED_COLUMNS = {
     "resume_url": "TEXT",
     # Original filename of a file the reviewer attached when sending, if any.
     # This is the ONLY thing this app keeps about it -- the bytes themselves
-    # are never written to this DB or to disk; see api.py's review_send and
-    # mail/graph.py's send_reply, which pass them straight through to Graph
-    # in the one request and let them go out of scope after.
+    # are never written to this DB or to disk; api.py's review_send passes
+    # them straight to the waiting n8n execution (Outlook Draft node) in the
+    # one request and lets them go out of scope after.
     "attachment_name": "TEXT",
     # A scheduled follow-up on a thread, not a reply to a real inbound
     # question -- see create_followup(). `query` holds the topic (what to
@@ -768,11 +768,11 @@ def mark_sent(
     WHERE clause makes this idempotent (a retried request cannot flip an
     already-sent row) and lets the caller tell "sent" from "already sent" by
     checking whether a row was updated. Returns the row as it stood *before*
-    this call so the caller (about to place the real Graph send) still has
+    this call so the caller still has
     `ref` and `conversation_id` even though the row is now marked sent.
 
     `attachment_name` is the filename only, for History's benefit -- the file
-    itself was already sent to Graph and discarded by the time this runs; see
+    itself was already handed to n8n and discarded by the time this runs; see
     attachment_name's comment on _ADDED_COLUMNS above.
     """
     row = get_exchange(exchange_id, path=path)
