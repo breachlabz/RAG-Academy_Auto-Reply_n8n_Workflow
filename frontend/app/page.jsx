@@ -5,7 +5,6 @@ import ReviewRow from "../components/ReviewRow";
 import HistoryRow from "../components/HistoryRow";
 import RowHeader from "../components/RowHeader";
 import ThreadCard from "../components/ThreadCard";
-import KnowledgeView from "../components/KnowledgeView";
 import { fetchHistory, fetchManual, fetchQueue } from "../lib/api";
 
 const REVIEW_LABELS = ["Received / drafted", "Enquiry", "AI reply", "Edit & send"];
@@ -47,7 +46,6 @@ function clusterBySender(groups) {
 // at exactly /review, and a second page would need its own FastAPI route.
 function tabFromHash() {
   if (typeof window === "undefined") return "review";
-  if (window.location.hash === "#knowledge") return "knowledge";
   return window.location.hash === "#manual" ? "manual" : "review";
 }
 
@@ -194,15 +192,6 @@ export default function Page() {
           >
             Manual replies{manualCount ? <span className="tab-count">{manualCount}</span> : null}
           </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "knowledge"}
-            className={"tab" + (tab === "knowledge" ? " active" : "")}
-            onClick={() => switchTab("knowledge")}
-          >
-            Knowledge
-          </button>
         </nav>
         {tab === "review" && (
           <div className="toolbar">
@@ -211,8 +200,6 @@ export default function Page() {
           </div>
         )}
       </header>
-
-      {tab === "knowledge" && <KnowledgeView />}
 
       {tab === "manual" && (
         <section>

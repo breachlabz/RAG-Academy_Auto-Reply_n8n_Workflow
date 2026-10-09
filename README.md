@@ -48,7 +48,7 @@ system.
    (Graph, read)    │            (FastAPI :8100)  └──▶ embedder        (bge-m3, CPU)             │
                     │              │     ▲   the n8n AI Agent retrieves from the same Chroma     │
                     │              ▼     │                                                       │
-                    │      /review + Knowledge tab  (human approves every send)                  │
+                    │      /review  (human approves every send)                                  │
                     └──────────────┼─────┼────────────────────────────────────────────────────────┘
                                    │     │
                                    ▼     ▼
@@ -398,10 +398,11 @@ Every chunk in the collection has a row in `knowledge_chunks` in
 `data/threads.db`: `content` (the exact text embedded and shown to the model)
 and `metadata` (JSON: `source`, `heading`, `chunk_index`).
 
-- **UI:** `/review` → **Knowledge** tab: search, view, export JSON, and **Add
-  content**. Existing chunks cannot be edited or deleted from the UI or the
+- **No UI.** The review page has no Knowledge tab. New content comes in two
+  ways: a reply written on the **Manual replies** tab (§9a), or
+  `POST /knowledge`. Existing chunks cannot be edited or deleted through the
   API; change them in the source document and re-ingest.
-- **Additions:** each entry added in the UI (optional title + content) is
+- **Additions:** each entry added that way (optional title + content) is
   appended to `data/docs/Additions_N.docx`, 20 entries per file
   (`Additions_1.docx`, then `Additions_2.docx`, …), and that file is ingested
   immediately. Additions are ordinary document chunks — id
@@ -485,7 +486,7 @@ against a newer `threads.db`. If a release re-ingested the collection, re-run
 `ingest --reset` after rolling back.
 
 Release-specific steps for the version introducing `academic`/`non_academic`
-classification and the Knowledge tab, when upgrading an existing deployment:
+classification and the `knowledge_chunks` table, when upgrading an existing deployment:
 
 - `docker compose exec classifier python -m rag knowledge pull`
 - `docker compose up -d` also recreates `n8n` (new `host.docker.internal`
@@ -528,7 +529,7 @@ All services use `restart: unless-stopped` and come back after a host reboot.
 | *Do nothing*, `already handled (duplicate message_id)` | Same message polled again | Expected |
 | `/health` fails or Chroma errors in API logs | Chroma/embedder not ready | `docker compose logs local_chromadb embedder`; `docker compose restart classifier` |
 | `embedder` restarting | Model download in progress or disk full | `docker compose logs embedder`; ≥ 3 GB free |
-| Knowledge save returns 502 | Embedder or Chroma unreachable | Row unchanged; fix the service and retry |
+| `POST /knowledge` returns 502 | Embedder or Chroma unreachable | Row unchanged; fix the service and retry |
 | n8n Outlook *Connect* fails | Redirect mismatch | Browser must be at exactly `http://localhost:5678`; redirect URI must match §6a |
 | n8n agent answers from stale content | n8n Chroma credential points elsewhere | Must be `http://email-classifier-chroma:8000` (§7b) |
 | Send → 409 *no n8n execution is waiting* | Row did not come from the workflow (follow-up, `/generate-reply`) | Answer by hand |
@@ -553,7 +554,7 @@ on the host. No authentication — loopback/tunnel access only (§12).
 | `POST /emails/finalize` | `{"output", "conversation_id", "subject", "format"}` → `grounded`, `reply`, `subject`, `agent_output`, `reason` |
 | `POST /threads/reply` | `{"conversation_id", "reply", "subject", "grounded"}` → records the draft; queues it when grounded |
 | `GET /threads`, `GET /threads/{id}` | conversations / one conversation's turns |
-| `GET /review` | review UI (Reply review + Knowledge tabs) |
+| `GET /review` | review UI (Reply review + Manual replies tabs) |
 | `GET /review/manual` | enquiries with no grounded answer, awaiting a hand-written reply (same shape as `/review/queue`) |
 | `POST /review/manual` | `{"exchange_id", "resume_url", "subject"?}` → the workflow puts an unanswerable enquiry on that queue |
 | `GET /review/queue`, `GET /review/history` | pending / sent replies grouped by conversation |
@@ -561,7 +562,7 @@ on the host. No authentication — loopback/tunnel access only (§12).
 | `POST /review/{id}/drafted` | `{"reply"}` → called by the workflow's last node called by Record final draft with the reviewer's final text; marks the row sent |
 | `GET /knowledge` | all chunks `{id, content, metadata, origin, edited, created_at, updated_at}` + `sources` |
 | `POST /knowledge` | `{"content", "title"?}` → appended to `data/docs/Additions_N.docx` (20 per file) and ingested; returns `{file, entry, max, chunks}`. 422 empty content / 502 embedder or Chroma failure |
-| `GET /knowledge/export` | every chunk as a downloadable JSON file `{collection, exported_at, count, chunks}` — the **Export JSON** button on the Knowledge tab |
+| `GET /knowledge/export` | every chunk as a downloadable JSON file `{collection, exported_at, count, chunks}` |
 | `GET /knowledge/{id}` | one chunk. URL-encode ids (`#` → `%23`). 404 unknown. No `PUT`/`DELETE` — existing content is read-only |
 
 - `type` is `academic` only when academic and nothing else; otherwise
@@ -577,9 +578,9 @@ on the host. No authentication — loopback/tunnel access only (§12).
   only write to the mailbox is `createReply`, which makes a draft and cannot
   send; a person sends from Outlook.
 - **No network exposure.** Every service binds to `127.0.0.1` (model server to
-  the Docker bridge). The review UI, Knowledge editor and API have **no
+  the Docker bridge). The review UI and API have **no
   authentication** — access is via SSH tunnel only. Exposing them requires an
-  authenticating reverse proxy (SSO) in front; knowledge edits change live
+  authenticating reverse proxy (SSO) in front; `POST /knowledge` changes live
   replies.
 - **n8n executes arbitrary code** — never publish port 5678.
 - **Least privilege in Graph:** one delegated credential with

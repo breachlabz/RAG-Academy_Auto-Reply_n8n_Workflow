@@ -920,8 +920,8 @@ def _body_without_shell(reply: str) -> str:
 
 
 def _learn_from_manual(row: dict, reply: str) -> dict:
-    """Add a hand-written reply to the knowledge base, exactly as the
-    Knowledge page's "Add content" does (rag.additions), so the next enquiry
+    """Add a hand-written reply to the knowledge base, exactly as
+    POST /knowledge does (rag.additions), so the next enquiry
     on the same point can be answered from it. The entry is the question's
     one-line gist as its title and the reply body under it -- never the
     enquirer's own email text. Never raises: the reply is already recorded,
@@ -1125,8 +1125,8 @@ def knowledge_add(req: KnowledgeAddRequest) -> dict:
 # swallow "export" as a chunk id.
 @app.get("/knowledge/export")
 def knowledge_export() -> Response:
-    """Everything in the knowledge base as one downloadable JSON file -- the
-    "Export JSON" button on the Knowledge tab. Read-only, same data as GET
+    """Everything in the knowledge base as one downloadable JSON file.
+    Read-only, same data as GET
     /knowledge, with a Content-Disposition header so a browser saves it."""
     chunks = rag_knowledge.list_chunks()
     now = datetime.datetime.now(datetime.timezone.utc)
